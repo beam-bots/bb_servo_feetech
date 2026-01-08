@@ -1,0 +1,87 @@
+# SPDX-FileCopyrightText: 2025 James Harton
+#
+# SPDX-License-Identifier: Apache-2.0
+
+defmodule BB.Servo.Feetech.MixProject do
+  use Mix.Project
+
+  @moduledoc """
+  Beam Bots integration for Feetech/WaveShare servos.
+  """
+
+  @version "0.1.0"
+
+  def project do
+    [
+      aliases: aliases(),
+      app: :bb_servo_feetech,
+      consolidate_protocols: Mix.env() == :prod,
+      deps: deps(),
+      description: @moduledoc,
+      dialyzer: dialyzer(),
+      docs: docs(),
+      elixir: "~> 1.19",
+      elixirc_paths: elixirc_paths(Mix.env()),
+      package: package(),
+      start_permanent: Mix.env() == :prod,
+      version: @version
+    ]
+  end
+
+  defp dialyzer, do: []
+
+  defp package do
+    [
+      maintainers: ["James Harton <james@harton.nz>"],
+      licenses: ["Apache-2.0"],
+      links: %{
+        "Source" => "https://github.com/beam-bots/bb_servo_feetech",
+        "Sponsor" => "https://github.com/sponsors/jimsynz"
+      }
+    ]
+  end
+
+  # Run "mix help compile.app" to learn about applications.
+  def application do
+    [
+      extra_applications: [:logger]
+    ]
+  end
+
+  defp docs do
+    [
+      main: "readme",
+      extras:
+        ["README.md", "CHANGELOG.md"]
+        |> Enum.concat(Path.wildcard("documentation/**/*.{md,livemd,cheatmd}")),
+      groups_for_extras: [
+        Tutorials: ~r/tutorials\//
+      ],
+      source_ref: "main",
+      source_url: "https://github.com/beam-bots/bb_servo_feetech"
+    ]
+  end
+
+  defp aliases, do: []
+
+  # Run "mix help deps" to learn about dependencies.
+  defp deps do
+    [
+      {:bb, "~> 0.13"},
+      {:feetech, "~> 0.2"},
+
+      # dev/test
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
+      {:ex_check, "~> 0.16", only: [:dev, :test], runtime: false},
+      {:ex_doc, ">= 0.0.0", only: [:dev, :test], runtime: false},
+      {:git_ops, "~> 2.9", only: [:dev, :test], runtime: false},
+      {:igniter, "~> 0.6", only: [:dev, :test], runtime: false},
+      {:mimic, "~> 2.2", only: :test, runtime: false},
+      {:mix_audit, "~> 2.1", only: [:dev, :test], runtime: false}
+    ]
+  end
+
+  defp elixirc_paths(env) when env in [:dev, :test], do: ["lib", "test/support"]
+  defp elixirc_paths(_), do: ["lib"]
+end
