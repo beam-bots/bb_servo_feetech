@@ -11,3 +11,12 @@ See [Conventional Commits](Https://conventionalcommits.org) for commit guideline
 
 <!-- changelog -->
 
+## [v0.2.0](https://github.com/beam-bots/bb_servo_pca9685/compare/v0.1.0...v0.2.0) (2026-01-09)
+
+
+
+
+### Features:
+
+* implement Feetech servo driver with controller, actuator, and bridge by James Harton
+
