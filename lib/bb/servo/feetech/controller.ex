@@ -322,14 +322,7 @@ defmodule BB.Servo.Feetech.Controller do
         # Buffer goal = present for each servo using reg_write.
         # reg_write stores data in a buffer WITHOUT writing to the register,
         # so it won't auto-enable torque like a direct write would.
-        Enum.zip(servo_ids, positions)
-        |> Enum.each(fn {id, position_rad} ->
-          case Feetech.reg_write(state.feetech, id, :goal_position, position_rad) do
-            :ok -> :ok
-            {:ok, _} -> :ok
-            error -> Logger.warning("Servo #{id} reg_write failed: #{inspect(error)}")
-          end
-        end)
+        buffer_goal_positions(state.feetech, servo_ids, positions)
 
         # Trigger all buffered writes simultaneously.
         # When the goals are written atomically, torque auto-enables with the
@@ -345,6 +338,17 @@ defmodule BB.Servo.Feetech.Controller do
     Feetech.sync_write_raw(state.feetech, :torque_enable, torque_on)
     lock_values = Enum.map(servo_ids, fn id -> {id, 1} end)
     Feetech.sync_write_raw(state.feetech, :lock, lock_values)
+  end
+
+  defp buffer_goal_positions(feetech, servo_ids, positions) do
+    Enum.zip(servo_ids, positions)
+    |> Enum.each(fn {id, position_rad} ->
+      case Feetech.reg_write(feetech, id, :goal_position, position_rad) do
+        :ok -> :ok
+        {:ok, _} -> :ok
+        error -> Logger.warning("Servo #{id} reg_write failed: #{inspect(error)}")
+      end
+    end)
   end
 
   defp poll_positions(%{servo_registry: registry} = state) when map_size(registry) == 0 do
