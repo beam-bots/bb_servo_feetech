@@ -9,7 +9,7 @@ defmodule BB.Servo.Feetech.MixProject do
   Beam Bots integration for Feetech/WaveShare servos.
   """
 
-  @version "0.2.0"
+  @version "0.2.1"
 
   def project do
     [
