@@ -38,7 +38,9 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       |> stub(:call, fn _robot, _controller, msg ->
         case msg do
           {:write, _id, :torque_enable, false} -> :ok
+          {:write, _id, :lock, false} -> :ok
           {:write_raw, _id, :goal_position, _pos} -> :ok
+          {:read_raw, _id, :present_position} -> {:ok, 2048}
           {:register_servo, _, _, _, _, _} -> :ok
         end
       end)
@@ -82,28 +84,9 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       assert {:ok, _state} = Actuator.init(opts)
     end
 
-    test "sets initial position to joint center" do
-      BB.Process
-      |> expect(:call, fn TestRobot, :feetech, {:write, 1, :torque_enable, false} -> :ok end)
-      |> expect(:call, fn TestRobot, :feetech, {:write_raw, 1, :goal_position, position} ->
-        assert position == 2048
-        :ok
-      end)
-      |> expect(:call, fn TestRobot, :feetech, {:register_servo, _, _, _, _, _} -> :ok end)
-
-      opts = [
-        bb: %{robot: TestRobot, path: [:shoulder, :servo]},
-        servo_id: 1,
-        controller: :feetech
-      ]
-
-      assert {:ok, _state} = Actuator.init(opts)
-    end
-
     test "registers servo with controller" do
       BB.Process
       |> expect(:call, fn TestRobot, :feetech, {:write, 1, :torque_enable, false} -> :ok end)
-      |> expect(:call, fn TestRobot, :feetech, {:write_raw, 1, :goal_position, _} -> :ok end)
       |> expect(:call, fn TestRobot,
                           :feetech,
                           {:register_servo, 1, :shoulder, center, 2, false} ->

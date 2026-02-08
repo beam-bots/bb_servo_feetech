@@ -22,6 +22,11 @@ defmodule BB.Servo.Feetech.ControllerTest do
         assert {2, false} in values
         :ok
       end)
+      |> expect(:sync_write, fn ^feetech_pid, :lock, values ->
+        assert {1, false} in values
+        assert {2, false} in values
+        :ok
+      end)
 
       opts = [
         feetech: feetech_pid,
