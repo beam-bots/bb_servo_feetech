@@ -68,6 +68,8 @@ defmodule BB.Servo.Feetech.Actuator do
   alias BB.Message.Actuator.Command
   alias BB.Process, as: BBProcess
 
+  require Logger
+
   @position_resolution 4096
   @position_center 2048
 
@@ -85,8 +87,7 @@ defmodule BB.Servo.Feetech.Actuator do
   @impl BB.Actuator
   def init(opts) do
     with {:ok, state} <- build_state(opts),
-         :ok <- disable_torque(state),
-         :ok <- set_initial_position(state) do
+         :ok <- disable_torque(state) do
       :ok =
         BBProcess.call(
           state.bb.robot,
@@ -200,20 +201,6 @@ defmodule BB.Servo.Feetech.Actuator do
            state.bb.robot,
            state.controller,
            {:write, state.servo_id, :torque_enable, false}
-         ) do
-      :ok -> :ok
-      {:ok, _} -> :ok
-      {:error, _} = error -> error
-    end
-  end
-
-  defp set_initial_position(state) do
-    position = angle_to_position(state.center_angle, state)
-
-    case BBProcess.call(
-           state.bb.robot,
-           state.controller,
-           {:write_raw, state.servo_id, :goal_position, position}
          ) do
       :ok -> :ok
       {:ok, _} -> :ok

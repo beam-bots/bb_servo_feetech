@@ -127,7 +127,9 @@ defmodule BB.Servo.Feetech.Controller do
     try do
       if servo_ids != [] do
         values = Enum.map(servo_ids, fn id -> {id, false} end)
+        # Write to both torque_enable AND lock (as lerobot does)
         Feetech.sync_write(feetech, :torque_enable, values)
+        Feetech.sync_write(feetech, :lock, values)
       end
 
       :ok
@@ -308,9 +310,41 @@ defmodule BB.Servo.Feetech.Controller do
   end
 
   defp enable_all_torque(state) do
-    servo_ids = Map.keys(state.servo_registry)
-    values = Enum.map(servo_ids, fn id -> {id, true} end)
-    Feetech.sync_write(state.feetech, :torque_enable, values)
+    servo_ids = Map.keys(state.servo_registry) |> Enum.sort()
+
+    # Disable torque so we can read positions without interference
+    torque_off = Enum.map(servo_ids, fn id -> {id, 0} end)
+    Feetech.sync_write_raw(state.feetech, :torque_enable, torque_off)
+
+    # Read current positions in radians
+    case Feetech.sync_read(state.feetech, servo_ids, :present_position) do
+      {:ok, positions} ->
+        # Buffer goal = present for each servo using reg_write.
+        # reg_write stores data in a buffer WITHOUT writing to the register,
+        # so it won't auto-enable torque like a direct write would.
+        Enum.zip(servo_ids, positions)
+        |> Enum.each(fn {id, position_rad} ->
+          case Feetech.reg_write(state.feetech, id, :goal_position, position_rad) do
+            :ok -> :ok
+            {:ok, _} -> :ok
+            error -> Logger.warning("Servo #{id} reg_write failed: #{inspect(error)}")
+          end
+        end)
+
+        # Trigger all buffered writes simultaneously.
+        # When the goals are written atomically, torque auto-enables with the
+        # correct goal already in place — no stale-goal impulse.
+        Feetech.action(state.feetech)
+
+      {:error, reason} ->
+        Logger.warning("Failed to read positions before arming: #{inspect(reason)}")
+    end
+
+    # Explicitly enable torque and lock (in case auto-enable didn't fire)
+    torque_on = Enum.map(servo_ids, fn id -> {id, 1} end)
+    Feetech.sync_write_raw(state.feetech, :torque_enable, torque_on)
+    lock_values = Enum.map(servo_ids, fn id -> {id, 1} end)
+    Feetech.sync_write_raw(state.feetech, :lock, lock_values)
   end
 
   defp poll_positions(%{servo_registry: registry} = state) when map_size(registry) == 0 do
