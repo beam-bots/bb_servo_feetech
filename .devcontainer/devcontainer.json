@@ -1,0 +1,7 @@
+{
+  "name": "BB.Servo.Feetech",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
+  "features": {
+    "ghcr.io/devcontainers/features/asdf": {}
+  }
+}

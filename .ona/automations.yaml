@@ -1,0 +1,23 @@
+tasks:
+  install-tools:
+    name: Install asdf plugins and runtimes
+    description: Install Erlang and Elixir versions defined in .tool-versions via asdf.
+    command: |
+      asdf plugin add erlang || true
+      asdf plugin add elixir || true
+      asdf plugin add pipx || true
+      asdf install
+    triggeredBy:
+      - postDevcontainerStart
+
+  install-deps:
+    name: Install Mix dependencies
+    description: Fetch and compile Hex dependencies.
+    command: |
+      mix local.hex --force
+      mix local.rebar --force
+      mix deps.get
+    triggeredBy:
+      - postDevcontainerStart
+    dependsOn:
+      - install-tools
