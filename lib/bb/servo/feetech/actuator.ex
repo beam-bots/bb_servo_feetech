@@ -70,6 +70,27 @@ defmodule BB.Servo.Feetech.Actuator do
 
   require Logger
 
+  defmodule State do
+    @moduledoc false
+    defstruct [
+      :bb,
+      :center_angle,
+      :controller,
+      :current_angle,
+      :joint_name,
+      :lower_limit,
+      :name,
+      :range,
+      :servo_id,
+      :trajectory,
+      :trajectory_timer,
+      :upper_limit,
+      :velocity_limit,
+      position_deadband: 2,
+      reverse?: false
+    ]
+  end
+
   @position_resolution 4096
   @position_center 2048
 
@@ -120,20 +141,20 @@ defmodule BB.Servo.Feetech.Actuator do
       center_angle = (lower_limit + upper_limit) / 2
       velocity_limit = limits.velocity
 
-      state = %{
+      state = %State{
         bb: opts.bb,
-        servo_id: opts.servo_id,
-        controller: opts.controller,
-        reverse?: reverse?,
-        position_deadband: position_deadband,
-        lower_limit: lower_limit,
-        upper_limit: upper_limit,
         center_angle: center_angle,
-        range: range,
-        velocity_limit: velocity_limit,
+        controller: opts.controller,
         current_angle: center_angle,
+        joint_name: joint_name,
+        lower_limit: lower_limit,
         name: name,
-        joint_name: joint_name
+        position_deadband: position_deadband,
+        range: range,
+        reverse?: reverse?,
+        servo_id: opts.servo_id,
+        upper_limit: upper_limit,
+        velocity_limit: velocity_limit
       }
 
       {:ok, state}
@@ -211,16 +232,36 @@ defmodule BB.Servo.Feetech.Actuator do
   @impl BB.Actuator
   def handle_info({:bb, _path, %Message{payload: %Command.Position{} = cmd}}, state) do
     if BB.Safety.armed?(state.bb.robot) do
-      {:noreply, _state} = do_set_position(cmd.position, cmd.command_id, state)
+      {:noreply, _state} = do_set_position(cmd, state)
     else
       {:noreply, state}
     end
   end
 
+  def handle_info({:bb, _path, %Message{payload: %Command.Trajectory{} = cmd}}, state) do
+    if BB.Safety.armed?(state.bb.robot) do
+      {:noreply, start_trajectory(cmd, state)}
+    else
+      {:noreply, state}
+    end
+  end
+
+  def handle_info(:trajectory_next, state) do
+    {:noreply, advance_trajectory(state)}
+  end
+
   @impl BB.Actuator
   def handle_cast({:command, %Message{payload: %Command.Position{} = cmd}}, state) do
     if BB.Safety.armed?(state.bb.robot) do
-      do_set_position(cmd.position, cmd.command_id, state)
+      do_set_position(cmd, state)
+    else
+      {:noreply, state}
+    end
+  end
+
+  def handle_cast({:command, %Message{payload: %Command.Trajectory{} = cmd}}, state) do
+    if BB.Safety.armed?(state.bb.robot) do
+      {:noreply, start_trajectory(cmd, state)}
     else
       {:noreply, state}
     end
@@ -229,18 +270,31 @@ defmodule BB.Servo.Feetech.Actuator do
   @impl BB.Actuator
   def handle_call({:command, %Message{payload: %Command.Position{} = cmd}}, _from, state) do
     if BB.Safety.armed?(state.bb.robot) do
-      {:noreply, new_state} = do_set_position(cmd.position, cmd.command_id, state)
+      {:noreply, new_state} = do_set_position(cmd, state)
       {:reply, {:ok, :accepted}, new_state}
     else
       {:reply, {:error, :not_armed}, state}
     end
   end
 
-  defp do_set_position(angle, command_id, state) when is_integer(angle),
-    do: do_set_position(angle * 1.0, command_id, state)
+  def handle_call({:command, %Message{payload: %Command.Trajectory{} = cmd}}, _from, state) do
+    if BB.Safety.armed?(state.bb.robot) do
+      {:reply, {:ok, :accepted}, start_trajectory(cmd, state)}
+    else
+      {:reply, {:error, :not_armed}, state}
+    end
+  end
 
-  defp do_set_position(angle, command_id, state) do
-    clamped_angle = clamp_angle(angle, state)
+  defp do_set_position(%Command.Position{position: angle} = cmd, state)
+       when is_integer(angle),
+       do: do_set_position(%{cmd | position: angle * 1.0}, state)
+
+  defp do_set_position(%Command.Position{} = cmd, state) do
+    state = cancel_trajectory(state)
+    clamped_angle = clamp_angle(cmd.position, state)
+
+    write_goal_speed(cmd, clamped_angle, state)
+
     new_position = angle_to_position(clamped_angle, state)
 
     :ok =
@@ -250,8 +304,7 @@ defmodule BB.Servo.Feetech.Actuator do
         {:write_raw, state.servo_id, :goal_position, new_position}
       )
 
-    travel_distance = abs(state.current_angle - clamped_angle)
-    travel_time_ms = round(travel_distance / state.velocity_limit * 1000)
+    travel_time_ms = estimate_travel_time_ms(cmd, clamped_angle, state)
     expected_arrival = System.monotonic_time(:millisecond) + travel_time_ms
 
     message_opts =
@@ -261,13 +314,161 @@ defmodule BB.Servo.Feetech.Actuator do
         expected_arrival: expected_arrival,
         command_type: :position
       ]
-      |> maybe_add_opt(:command_id, command_id)
+      |> maybe_add_opt(:command_id, cmd.command_id)
 
     message = Message.new!(BeginMotion, state.joint_name, message_opts)
 
     BB.publish(state.bb.robot, [:actuator | state.bb.path], message)
 
     {:noreply, %{state | current_angle: clamped_angle}}
+  end
+
+  defp write_goal_speed(%Command.Position{velocity: velocity}, _clamped_angle, state)
+       when is_number(velocity) do
+    BBProcess.cast(
+      state.bb.robot,
+      state.controller,
+      {:write, state.servo_id, :goal_speed, velocity}
+    )
+  end
+
+  defp write_goal_speed(%Command.Position{duration: duration}, clamped_angle, state)
+       when is_integer(duration) and duration > 0 do
+    travel_distance = abs(state.current_angle - clamped_angle)
+    velocity = travel_distance / (duration / 1000)
+
+    BBProcess.cast(
+      state.bb.robot,
+      state.controller,
+      {:write, state.servo_id, :goal_speed, velocity}
+    )
+  end
+
+  defp write_goal_speed(_cmd, _clamped_angle, state) do
+    BBProcess.cast(
+      state.bb.robot,
+      state.controller,
+      {:write, state.servo_id, :goal_speed, 0}
+    )
+  end
+
+  defp estimate_travel_time_ms(%Command.Position{velocity: velocity}, clamped_angle, state)
+       when is_number(velocity) and velocity > 0 do
+    travel_distance = abs(state.current_angle - clamped_angle)
+    round(travel_distance / velocity * 1000)
+  end
+
+  defp estimate_travel_time_ms(%Command.Position{duration: duration}, _clamped_angle, _state)
+       when is_integer(duration) and duration > 0 do
+    duration
+  end
+
+  defp estimate_travel_time_ms(_cmd, clamped_angle, state) do
+    travel_distance = abs(state.current_angle - clamped_angle)
+    round(travel_distance / state.velocity_limit * 1000)
+  end
+
+  defp start_trajectory(%Command.Trajectory{waypoints: waypoints} = cmd, state) do
+    state = cancel_trajectory(state)
+
+    trajectory = %{
+      waypoints: waypoints,
+      index: 0,
+      repeat: cmd.repeat || 1,
+      command_id: cmd.command_id,
+      started_at: System.monotonic_time(:millisecond)
+    }
+
+    last_time = List.last(waypoints)[:time_from_start]
+    expected_arrival = System.monotonic_time(:millisecond) + last_time
+
+    message_opts =
+      [
+        initial_position: state.current_angle,
+        target_position: hd(waypoints)[:position],
+        expected_arrival: expected_arrival,
+        command_type: :trajectory
+      ]
+      |> maybe_add_opt(:command_id, cmd.command_id)
+
+    message = Message.new!(BeginMotion, state.joint_name, message_opts)
+    BB.publish(state.bb.robot, [:actuator | state.bb.path], message)
+
+    execute_and_schedule(trajectory, %{state | trajectory: trajectory})
+  end
+
+  defp advance_trajectory(%{trajectory: nil} = state), do: state
+
+  defp advance_trajectory(%{trajectory: trajectory} = state) do
+    next_index = trajectory.index + 1
+
+    if next_index >= length(trajectory.waypoints) do
+      handle_trajectory_end(trajectory, state)
+    else
+      trajectory = %{trajectory | index: next_index}
+      execute_and_schedule(trajectory, %{state | trajectory: trajectory})
+    end
+  end
+
+  defp handle_trajectory_end(%{repeat: :forever} = trajectory, state) do
+    trajectory = %{trajectory | index: 0, started_at: System.monotonic_time(:millisecond)}
+    execute_and_schedule(trajectory, %{state | trajectory: trajectory})
+  end
+
+  defp handle_trajectory_end(%{repeat: n} = trajectory, state) when n > 1 do
+    trajectory = %{
+      trajectory
+      | index: 0,
+        repeat: n - 1,
+        started_at: System.monotonic_time(:millisecond)
+    }
+
+    execute_and_schedule(trajectory, %{state | trajectory: trajectory})
+  end
+
+  defp handle_trajectory_end(_trajectory, state) do
+    %{state | trajectory: nil, trajectory_timer: nil}
+  end
+
+  defp execute_and_schedule(trajectory, state) do
+    waypoint = Enum.at(trajectory.waypoints, trajectory.index)
+    velocity = waypoint[:velocity] || 0
+    clamped_angle = clamp_angle(waypoint[:position], state)
+
+    BBProcess.cast(
+      state.bb.robot,
+      state.controller,
+      {:write, state.servo_id, :goal_speed, velocity}
+    )
+
+    new_position = angle_to_position(clamped_angle, state)
+
+    BBProcess.cast(
+      state.bb.robot,
+      state.controller,
+      {:write_raw, state.servo_id, :goal_position, new_position}
+    )
+
+    state = %{state | current_angle: clamped_angle}
+
+    next_index = trajectory.index + 1
+
+    if next_index < length(trajectory.waypoints) do
+      next_waypoint = Enum.at(trajectory.waypoints, next_index)
+      delay = next_waypoint[:time_from_start] - waypoint[:time_from_start]
+      timer = Process.send_after(self(), :trajectory_next, delay)
+      %{state | trajectory_timer: timer}
+    else
+      timer = Process.send_after(self(), :trajectory_next, 0)
+      %{state | trajectory_timer: timer}
+    end
+  end
+
+  defp cancel_trajectory(%{trajectory_timer: nil} = state), do: state
+
+  defp cancel_trajectory(%{trajectory_timer: timer} = state) do
+    Process.cancel_timer(timer)
+    %{state | trajectory: nil, trajectory_timer: nil}
   end
 
   defp maybe_add_opt(opts, _key, nil), do: opts
