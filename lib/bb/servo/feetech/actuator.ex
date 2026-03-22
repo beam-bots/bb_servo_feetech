@@ -12,17 +12,18 @@ defmodule BB.Servo.Feetech.Actuator do
   - Position range maps to the servo's goal_position register
 
   When initialised, the actuator:
-  1. Sets the goal position to joint center (servo won't move until armed)
-  2. Registers the servo with the controller for position feedback and torque management
+  1. Disables torque on the servo
+  2. Registers with the controller, receiving the shared ETS table reference
+  3. Subscribes to position commands
 
   When a position command is received, the actuator:
   1. Clamps the position to joint limits
   2. Converts to servo position units (0-4095 for 360 degrees)
-  3. Sends goal_position command to the Feetech controller
+  3. Writes goal_position and goal_speed to the controller's ETS table
   4. Publishes a `BB.Message.Actuator.BeginMotion` message
 
-  Position feedback and torque management are handled by the controller. Servos
-  remain unpowered until the robot is armed, then move to their goal positions.
+  The controller picks up pending commands on its next loop tick and batches them
+  into efficient `sync_write` operations on the serial bus.
 
   ## Example DSL Usage
 
@@ -82,6 +83,7 @@ defmodule BB.Servo.Feetech.Actuator do
       :name,
       :range,
       :servo_id,
+      :servo_table,
       :trajectory,
       :trajectory_timer,
       :upper_limit,
@@ -93,6 +95,10 @@ defmodule BB.Servo.Feetech.Actuator do
 
   @position_resolution 4096
   @position_center 2048
+
+  # ETS tuple field indices for command writes
+  @ets_idx_goal_position 12
+  @ets_idx_goal_speed 13
 
   @doc """
   Safety disarm callback.
@@ -108,18 +114,11 @@ defmodule BB.Servo.Feetech.Actuator do
   @impl BB.Actuator
   def init(opts) do
     with {:ok, state} <- build_state(opts),
-         :ok <- disable_torque(state) do
-      :ok =
-        BBProcess.call(
-          state.bb.robot,
-          state.controller,
-          {:register_servo, state.servo_id, state.joint_name, state.center_angle,
-           state.position_deadband, state.reverse?}
-        )
-
+         :ok <- disable_torque(state),
+         {:ok, servo_table} <- register_servo(state) do
       BB.subscribe(state.bb.robot, [:actuator, state.joint_name, state.name])
 
-      {:ok, state}
+      {:ok, %{state | servo_table: servo_table}}
     else
       {:error, reason} -> {:stop, reason}
     end
@@ -229,6 +228,17 @@ defmodule BB.Servo.Feetech.Actuator do
     end
   end
 
+  defp register_servo(state) do
+    BBProcess.call(
+      state.bb.robot,
+      state.controller,
+      {:register_servo, state.servo_id, state.joint_name, state.center_angle,
+       state.position_deadband, state.reverse?}
+    )
+  end
+
+  # --- Command handling ---
+
   @impl BB.Actuator
   def handle_info({:bb, _path, %Message{payload: %Command.Position{} = cmd}}, state) do
     if BB.Safety.armed?(state.bb.robot) do
@@ -285,6 +295,8 @@ defmodule BB.Servo.Feetech.Actuator do
     end
   end
 
+  # --- Position commands ---
+
   defp do_set_position(%Command.Position{position: angle} = cmd, state)
        when is_integer(angle),
        do: do_set_position(%{cmd | position: angle * 1.0}, state)
@@ -293,16 +305,10 @@ defmodule BB.Servo.Feetech.Actuator do
     state = cancel_trajectory(state)
     clamped_angle = clamp_angle(cmd.position, state)
 
-    write_goal_speed(cmd, clamped_angle, state)
+    goal_speed = compute_goal_speed(cmd, clamped_angle, state)
+    goal_position = angle_to_position(clamped_angle, state)
 
-    new_position = angle_to_position(clamped_angle, state)
-
-    :ok =
-      BBProcess.cast(
-        state.bb.robot,
-        state.controller,
-        {:write_raw, state.servo_id, :goal_position, new_position}
-      )
+    write_servo_command(state, goal_position, goal_speed)
 
     travel_time_ms = estimate_travel_time_ms(cmd, clamped_angle, state)
     expected_arrival = System.monotonic_time(:millisecond) + travel_time_ms
@@ -323,33 +329,25 @@ defmodule BB.Servo.Feetech.Actuator do
     {:noreply, %{state | current_angle: clamped_angle}}
   end
 
-  defp write_goal_speed(%Command.Position{velocity: velocity}, _clamped_angle, state)
-       when is_number(velocity) do
-    BBProcess.cast(
-      state.bb.robot,
-      state.controller,
-      {:write, state.servo_id, :goal_speed, velocity}
-    )
-  end
+  defp compute_goal_speed(%Command.Position{velocity: velocity}, _clamped_angle, _state)
+       when is_number(velocity),
+       do: velocity
 
-  defp write_goal_speed(%Command.Position{duration: duration}, clamped_angle, state)
+  defp compute_goal_speed(%Command.Position{duration: duration}, clamped_angle, state)
        when is_integer(duration) and duration > 0 do
     travel_distance = abs(state.current_angle - clamped_angle)
-    velocity = travel_distance / (duration / 1000)
-
-    BBProcess.cast(
-      state.bb.robot,
-      state.controller,
-      {:write, state.servo_id, :goal_speed, velocity}
-    )
+    travel_distance / (duration / 1000)
   end
 
-  defp write_goal_speed(_cmd, _clamped_angle, state) do
-    BBProcess.cast(
-      state.bb.robot,
-      state.controller,
-      {:write, state.servo_id, :goal_speed, 0}
-    )
+  defp compute_goal_speed(_cmd, _clamped_angle, _state), do: 0
+
+  defp write_servo_command(state, goal_position, goal_speed) do
+    :ets.update_element(state.servo_table, state.servo_id, [
+      {@ets_idx_goal_position, goal_position},
+      {@ets_idx_goal_speed, goal_speed}
+    ])
+  rescue
+    ArgumentError -> false
   end
 
   defp estimate_travel_time_ms(%Command.Position{velocity: velocity}, clamped_angle, state)
@@ -367,6 +365,8 @@ defmodule BB.Servo.Feetech.Actuator do
     travel_distance = abs(state.current_angle - clamped_angle)
     round(travel_distance / state.velocity_limit * 1000)
   end
+
+  # --- Trajectory commands ---
 
   defp start_trajectory(%Command.Trajectory{waypoints: waypoints} = cmd, state) do
     state = cancel_trajectory(state)
@@ -435,19 +435,8 @@ defmodule BB.Servo.Feetech.Actuator do
     velocity = waypoint[:velocity] || 0
     clamped_angle = clamp_angle(waypoint[:position], state)
 
-    BBProcess.cast(
-      state.bb.robot,
-      state.controller,
-      {:write, state.servo_id, :goal_speed, velocity}
-    )
-
-    new_position = angle_to_position(clamped_angle, state)
-
-    BBProcess.cast(
-      state.bb.robot,
-      state.controller,
-      {:write_raw, state.servo_id, :goal_position, new_position}
-    )
+    goal_position = angle_to_position(clamped_angle, state)
+    write_servo_command(state, goal_position, velocity)
 
     state = %{state | current_angle: clamped_angle}
 
@@ -470,6 +459,8 @@ defmodule BB.Servo.Feetech.Actuator do
     Process.cancel_timer(timer)
     %{state | trajectory: nil, trajectory_timer: nil}
   end
+
+  # --- Helpers ---
 
   defp maybe_add_opt(opts, _key, nil), do: opts
   defp maybe_add_opt(opts, key, value), do: Keyword.put(opts, key, value)

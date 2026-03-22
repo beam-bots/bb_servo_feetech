@@ -6,21 +6,19 @@ defmodule BB.Servo.Feetech.Controller do
   @moduledoc """
   A controller that manages a Feetech servo bus.
 
-  This controller wraps the `Feetech` GenServer and provides an interface
-  for actuators to communicate with servos via the serial bus. Multiple
-  actuators can share a single controller, with each actuator controlling
-  a different servo ID (1-253).
+  This controller wraps the `Feetech` GenServer and provides a shared ETS table
+  for actuators to write commands to. The controller runs a fixed-rate control
+  loop that batches all pending commands into efficient bulk writes (`sync_write`)
+  and reads positions via bulk reads (`sync_read`).
 
-  ## Position Feedback
+  On each loop tick, the controller:
 
-  The controller handles position feedback for all registered servos using
-  efficient bulk reads (`sync_read`). When actuators register with the
-  controller, they provide their joint mapping information. The controller
-  then polls all registered servos at a configurable interval and publishes
-  `JointState` messages.
-
-  This eliminates the need for separate sensor GenServers and prevents
-  bus contention from multiple concurrent read requests.
+  1. Reads all pending commands from the ETS table
+  2. Batches them into `sync_write` operations for the serial bus
+  3. Clears the command fields
+  4. Reads all servo positions via `sync_read`
+  5. Updates the ETS table with current positions
+  6. Publishes `JointState` messages for positions that exceed deadband
 
   ## Configuration
 
@@ -30,7 +28,7 @@ defmodule BB.Servo.Feetech.Controller do
         port: "/dev/ttyUSB0",
         baud_rate: 1_000_000,
         control_table: Feetech.ControlTable.STS3215,
-        poll_interval_ms: 50
+        loop_interval_ms: 10
       }
 
   ## Options
@@ -38,17 +36,21 @@ defmodule BB.Servo.Feetech.Controller do
   - `:port` - (required) The serial port path, e.g., `"/dev/ttyUSB0"`
   - `:baud_rate` - Baud rate in bps (default: 1_000_000)
   - `:control_table` - The servo control table to use (default: `Feetech.ControlTable.STS3215`)
-  - `:poll_interval_ms` - Position feedback interval in ms (default: 50, i.e. 20Hz)
+  - `:loop_interval_ms` - Control loop interval in ms (default: 10, i.e. 100Hz)
   - `:status_poll_interval_ms` - Status polling interval in ms (default: 1000, set to 0 to disable)
   - `:disarm_action` - Action to take when robot is disarmed (default: `:disable_torque`)
     - `:disable_torque` - Disable torque on all servos (safe default)
     - `:hold` - Keep torque enabled (servos hold position)
 
-  ## Status Polling
+  ## ETS Table Structure
 
-  When enabled, the controller periodically reads status registers (temperature, voltage,
-  load, hardware errors) from all registered servos and publishes `ServoStatus` messages
-  to the sensor path.
+  Each registered servo has a row in the ETS table:
+
+      {servo_id, joint_name, center_angle, reverse?, position_deadband,
+       last_position_raw, goal_position, goal_speed}
+
+  Actuators write `goal_position` (raw units) and `goal_speed` (rad/s) via
+  `:ets.update_element/3`. The controller reads and clears them each tick.
 
   ## Safety
 
@@ -72,10 +74,10 @@ defmodule BB.Servo.Feetech.Controller do
         doc: "The servo control table to use",
         default: Feetech.ControlTable.STS3215
       ],
-      poll_interval_ms: [
+      loop_interval_ms: [
         type: :pos_integer,
-        doc: "Position feedback polling interval in milliseconds",
-        default: 50
+        doc: "Control loop interval in milliseconds (default: 10, i.e. 100Hz)",
+        default: 10
       ],
       status_poll_interval_ms: [
         type: :non_neg_integer,
@@ -99,6 +101,16 @@ defmodule BB.Servo.Feetech.Controller do
   alias BB.StateMachine.Transition
 
   @position_resolution 4096
+
+  # ETS tuple field indices (positions 2-5 are config, matched via pattern)
+  @idx_last_position_raw 6
+  @idx_present_position 7
+  @idx_present_temperature 8
+  @idx_present_voltage 9
+  @idx_present_load 10
+  @idx_hardware_error 11
+  @idx_goal_position 12
+  @idx_goal_speed 13
 
   # Diagnostic thresholds (Feetech servos typically run on 6-7.4V)
   @temp_warning_threshold 55.0
@@ -127,7 +139,6 @@ defmodule BB.Servo.Feetech.Controller do
     try do
       if servo_ids != [] do
         values = Enum.map(servo_ids, fn id -> {id, false} end)
-        # Write to both torque_enable AND lock (as lerobot does)
         Feetech.sync_write(feetech, :torque_enable, values)
         Feetech.sync_write(feetech, :lock, values)
       end
@@ -142,21 +153,33 @@ defmodule BB.Servo.Feetech.Controller do
   def init(opts) do
     bb = Keyword.fetch!(opts, :bb)
     control_table = Keyword.get(opts, :control_table, Feetech.ControlTable.STS3215)
-    poll_interval_ms = Keyword.get(opts, :poll_interval_ms, 50)
+    loop_interval_ms = Keyword.get(opts, :loop_interval_ms, 10)
     status_poll_interval_ms = Keyword.get(opts, :status_poll_interval_ms, 1000)
     disarm_action = Keyword.get(opts, :disarm_action, :disable_torque)
 
+    status_every_n_ticks =
+      if status_poll_interval_ms > 0 do
+        max(1, div(status_poll_interval_ms, loop_interval_ms))
+      else
+        0
+      end
+
     case start_feetech(opts) do
       {:ok, feetech} ->
+        servo_table = :ets.new(:servo_state, [:set, :public])
+
         state = %{
           bb: bb,
           feetech: feetech,
           control_table: control_table,
           name: List.last(bb.path),
-          poll_interval_ms: poll_interval_ms,
+          loop_interval_ms: loop_interval_ms,
           status_poll_interval_ms: status_poll_interval_ms,
+          status_every_n_ticks: status_every_n_ticks,
+          status_tick_counter: 0,
           disarm_action: disarm_action,
-          servo_registry: %{},
+          servo_table: servo_table,
+          servo_ids: [],
           last_status: %{}
         }
 
@@ -168,7 +191,7 @@ defmodule BB.Servo.Feetech.Controller do
 
         BB.subscribe(state.bb.robot, [:state_machine])
 
-        Process.send_after(self(), :start_polling, 100)
+        Process.send_after(self(), :start_loop, 100)
 
         {:ok, state}
 
@@ -185,32 +208,43 @@ defmodule BB.Servo.Feetech.Controller do
     )
   end
 
+  # --- Handle calls ---
+
   @impl BB.Controller
   def handle_call(
         {:register_servo, servo_id, joint_name, center_angle, position_deadband, reverse?},
         _from,
         state
       ) do
-    new_registry =
-      Map.put(state.servo_registry, servo_id, %{
-        joint_name: joint_name,
-        center_angle: center_angle,
-        position_deadband: position_deadband,
-        reverse?: reverse?,
-        last_position_raw: nil
-      })
+    :ets.insert(state.servo_table, {
+      servo_id,
+      joint_name,
+      center_angle,
+      reverse?,
+      position_deadband,
+      _last_position_raw = nil,
+      _present_position = nil,
+      _present_temperature = nil,
+      _present_voltage = nil,
+      _present_load = nil,
+      _hardware_error = nil,
+      _goal_position = nil,
+      _goal_speed = nil
+    })
+
+    servo_ids = [servo_id | state.servo_ids] |> Enum.sort() |> Enum.uniq()
 
     BB.Safety.register(__MODULE__,
       robot: state.bb.robot,
       path: state.bb.path,
       opts: [
         feetech: state.feetech,
-        servo_ids: Map.keys(new_registry),
+        servo_ids: servo_ids,
         disarm_action: state.disarm_action
       ]
     )
 
-    {:reply, :ok, %{state | servo_registry: new_registry}}
+    {:reply, {:ok, state.servo_table}, %{state | servo_ids: servo_ids}}
   end
 
   def handle_call({:read, servo_id, param}, _from, state) do
@@ -244,45 +278,32 @@ defmodule BB.Servo.Feetech.Controller do
   end
 
   def handle_call(:list_servos, _from, state) do
-    {:reply, {:ok, Map.keys(state.servo_registry)}, state}
+    {:reply, {:ok, state.servo_ids}, state}
   end
 
   def handle_call(:get_control_table, _from, state) do
     {:reply, {:ok, state.control_table}, state}
   end
 
-  @impl BB.Controller
-  def handle_cast({:write, servo_id, param, value}, state) do
-    Feetech.write(state.feetech, servo_id, param, value)
-    {:noreply, state}
-  end
-
-  def handle_cast({:write_raw, servo_id, param, value}, state) do
-    Feetech.write_raw(state.feetech, servo_id, param, value)
-    {:noreply, state}
-  end
-
-  def handle_cast({:sync_write, param, values}, state) do
-    Feetech.sync_write(state.feetech, param, values)
-    {:noreply, state}
-  end
+  # --- Handle info ---
 
   @impl BB.Controller
-  def handle_info(:start_polling, state) do
-    schedule_poll(state.poll_interval_ms)
-    schedule_status_poll(state.status_poll_interval_ms)
+  def handle_info(:start_loop, state) do
+    schedule_tick(state.loop_interval_ms)
     {:noreply, state}
   end
 
-  def handle_info(:poll, state) do
-    state = poll_positions(state)
-    schedule_poll(state.poll_interval_ms)
-    {:noreply, state}
-  end
+  def handle_info(:tick, state) do
+    tick_start = System.monotonic_time(:millisecond)
 
-  def handle_info(:poll_status, state) do
-    state = poll_status(state)
-    schedule_status_poll(state.status_poll_interval_ms)
+    state =
+      state
+      |> process_commands()
+      |> read_positions()
+      |> maybe_poll_status()
+
+    elapsed = System.monotonic_time(:millisecond) - tick_start
+    schedule_tick(max(0, state.loop_interval_ms - elapsed))
     {:noreply, state}
   end
 
@@ -295,73 +316,48 @@ defmodule BB.Servo.Feetech.Controller do
     {:noreply, state}
   end
 
-  defp schedule_poll(interval_ms) do
-    Process.send_after(self(), :poll, interval_ms)
+  # --- Control loop ---
+
+  defp schedule_tick(interval_ms) do
+    Process.send_after(self(), :tick, interval_ms)
   end
 
-  defp schedule_status_poll(0), do: :ok
+  defp process_commands(%{servo_ids: []} = state), do: state
 
-  defp schedule_status_poll(interval_ms) do
-    Process.send_after(self(), :poll_status, interval_ms)
-  end
+  defp process_commands(state) do
+    entries = :ets.tab2list(state.servo_table)
 
-  defp enable_all_torque(%{servo_registry: registry}) when map_size(registry) == 0 do
-    :ok
-  end
+    commands =
+      for {id, _, _, _, _, _, _, _, _, _, _, goal_pos, goal_speed} <- entries,
+          goal_pos != nil,
+          do: {id, goal_pos, goal_speed || 0}
 
-  defp enable_all_torque(state) do
-    servo_ids = Map.keys(state.servo_registry) |> Enum.sort()
+    if commands != [] do
+      speed_values = for {id, _, speed} <- commands, do: {id, speed}
+      position_values = for {id, pos, _} <- commands, do: {id, pos}
 
-    # Disable torque so we can read positions without interference
-    torque_off = Enum.map(servo_ids, fn id -> {id, 0} end)
-    Feetech.sync_write_raw(state.feetech, :torque_enable, torque_off)
+      Feetech.sync_write(state.feetech, :goal_speed, speed_values)
+      Feetech.sync_write_raw(state.feetech, :goal_position, position_values)
 
-    # Read current positions in radians
-    case Feetech.sync_read(state.feetech, servo_ids, :present_position) do
-      {:ok, positions} ->
-        # Buffer goal = present for each servo using reg_write.
-        # reg_write stores data in a buffer WITHOUT writing to the register,
-        # so it won't auto-enable torque like a direct write would.
-        buffer_goal_positions(state.feetech, servo_ids, positions)
-
-        # Trigger all buffered writes simultaneously.
-        # When the goals are written atomically, torque auto-enables with the
-        # correct goal already in place — no stale-goal impulse.
-        Feetech.action(state.feetech)
-
-      {:error, reason} ->
-        Logger.warning("Failed to read positions before arming: #{inspect(reason)}")
+      for {id, _, _} <- commands do
+        :ets.update_element(state.servo_table, id, [
+          {@idx_goal_position, nil},
+          {@idx_goal_speed, nil}
+        ])
+      end
     end
 
-    # Explicitly enable torque and lock (in case auto-enable didn't fire)
-    torque_on = Enum.map(servo_ids, fn id -> {id, 1} end)
-    Feetech.sync_write_raw(state.feetech, :torque_enable, torque_on)
-    lock_values = Enum.map(servo_ids, fn id -> {id, 1} end)
-    Feetech.sync_write_raw(state.feetech, :lock, lock_values)
-  end
-
-  defp buffer_goal_positions(feetech, servo_ids, positions) do
-    Enum.zip(servo_ids, positions)
-    |> Enum.each(fn {id, position_rad} ->
-      case Feetech.reg_write(feetech, id, :goal_position, position_rad) do
-        :ok -> :ok
-        {:ok, _} -> :ok
-        error -> Logger.warning("Servo #{id} reg_write failed: #{inspect(error)}")
-      end
-    end)
-  end
-
-  defp poll_positions(%{servo_registry: registry} = state) when map_size(registry) == 0 do
     state
   end
 
-  defp poll_positions(state) do
-    servo_ids = Map.keys(state.servo_registry)
+  defp read_positions(%{servo_ids: []} = state), do: state
 
-    case Feetech.sync_read(state.feetech, servo_ids, :present_position) do
+  defp read_positions(state) do
+    case Feetech.sync_read(state.feetech, state.servo_ids, :present_position) do
       {:ok, positions} ->
-        new_registry = publish_changed_positions(servo_ids, positions, state)
-        %{state | servo_registry: new_registry}
+        update_present_positions(state, positions)
+        publish_changed_positions(state.servo_ids, positions, state)
+        state
 
       {:error, reason} ->
         Logger.warning("Failed to read positions: #{inspect(reason)}")
@@ -370,12 +366,58 @@ defmodule BB.Servo.Feetech.Controller do
     end
   end
 
-  defp publish_changed_positions(servo_ids, positions, state) do
-    servo_ids
-    |> Enum.zip(positions)
-    |> Enum.reduce(state.servo_registry, fn {servo_id, position_rad}, registry ->
-      maybe_publish_position(state, registry, servo_id, position_rad)
+  defp maybe_poll_status(%{status_every_n_ticks: 0} = state), do: state
+
+  defp maybe_poll_status(state) do
+    counter = state.status_tick_counter + 1
+
+    if counter >= state.status_every_n_ticks do
+      poll_status(%{state | status_tick_counter: 0})
+    else
+      %{state | status_tick_counter: counter}
+    end
+  end
+
+  defp update_present_positions(state, positions) do
+    Enum.zip(state.servo_ids, positions)
+    |> Enum.each(fn {servo_id, position_rad} ->
+      :ets.update_element(state.servo_table, servo_id, [{@idx_present_position, position_rad}])
     end)
+  end
+
+  # --- Position publishing ---
+
+  defp publish_changed_positions(servo_ids, positions, state) do
+    Enum.zip(servo_ids, positions)
+    |> Enum.each(fn {servo_id, position_rad} ->
+      maybe_publish_position(state, servo_id, position_rad)
+    end)
+  end
+
+  defp maybe_publish_position(state, servo_id, position_rad) do
+    case :ets.lookup(state.servo_table, servo_id) do
+      [
+        {^servo_id, joint_name, center_angle, reverse?, position_deadband, last_position_raw, _,
+         _, _, _, _, _, _}
+      ] ->
+        if should_publish_position?(position_rad, last_position_raw, position_deadband) do
+          joint_angle = radians_to_joint_angle(position_rad, center_angle, reverse?)
+          publish_joint_state(state, joint_name, joint_angle)
+
+          :ets.update_element(state.servo_table, servo_id, [
+            {@idx_last_position_raw, position_rad}
+          ])
+        end
+
+      [] ->
+        :ok
+    end
+  end
+
+  defp should_publish_position?(_position_rad, nil, _deadband), do: true
+
+  defp should_publish_position?(position_rad, last_rad, deadband) do
+    position_exceeds_deadband?(position_rad, last_rad, deadband)
   end
 
   defp emit_sync_read_error_diagnostic(state, reason) do
@@ -386,56 +428,9 @@ defmodule BB.Servo.Feetech.Controller do
     )
   end
 
-  defp get_joint_name(state, servo_id) do
-    case Map.get(state.servo_registry, servo_id) do
-      %{joint_name: name} -> name
-      nil -> String.to_atom("servo_#{servo_id}")
-    end
-  end
-
-  defp maybe_publish_position(_state, registry, servo_id, _position_rad)
-       when not is_map_key(registry, servo_id) do
-    registry
-  end
-
-  defp maybe_publish_position(state, registry, servo_id, position_rad) do
-    entry = Map.fetch!(registry, servo_id)
-    maybe_publish_position_for_entry(state, registry, servo_id, position_rad, entry)
-  end
-
-  defp maybe_publish_position_for_entry(
-         state,
-         registry,
-         servo_id,
-         position_rad,
-         %{last_position_raw: nil} = entry
-       ) do
-    publish_and_update(state, registry, servo_id, position_rad, entry)
-  end
-
-  defp maybe_publish_position_for_entry(
-         state,
-         registry,
-         servo_id,
-         position_rad,
-         %{last_position_raw: last_rad, position_deadband: deadband} = entry
-       ) do
-    if position_exceeds_deadband?(position_rad, last_rad, deadband) do
-      publish_and_update(state, registry, servo_id, position_rad, entry)
-    else
-      registry
-    end
-  end
-
   defp position_exceeds_deadband?(position_rad, last_rad, deadband) do
     deadband_rad = deadband * 2 * :math.pi() / @position_resolution
     abs(position_rad - last_rad) >= deadband_rad
-  end
-
-  defp publish_and_update(state, registry, servo_id, position_rad, entry) do
-    joint_angle = radians_to_joint_angle(position_rad, entry.center_angle, entry.reverse?)
-    publish_joint_state(state, entry.joint_name, joint_angle)
-    Map.put(registry, servo_id, %{entry | last_position_raw: position_rad})
   end
 
   defp radians_to_joint_angle(position_rad, center_angle, reverse?) do
@@ -462,12 +457,48 @@ defmodule BB.Servo.Feetech.Controller do
     BB.publish(state.bb.robot, [:sensor, state.name, joint_name], msg)
   end
 
-  defp poll_status(%{servo_registry: registry} = state) when map_size(registry) == 0 do
-    state
+  # --- Arming ---
+
+  defp enable_all_torque(%{servo_ids: []}), do: :ok
+
+  defp enable_all_torque(state) do
+    servo_ids = state.servo_ids
+
+    torque_off = Enum.map(servo_ids, fn id -> {id, 0} end)
+    Feetech.sync_write_raw(state.feetech, :torque_enable, torque_off)
+
+    case Feetech.sync_read(state.feetech, servo_ids, :present_position) do
+      {:ok, positions} ->
+        buffer_goal_positions(state.feetech, servo_ids, positions)
+        Feetech.action(state.feetech)
+
+      {:error, reason} ->
+        Logger.warning("Failed to read positions before arming: #{inspect(reason)}")
+    end
+
+    torque_on = Enum.map(servo_ids, fn id -> {id, 1} end)
+    Feetech.sync_write_raw(state.feetech, :torque_enable, torque_on)
+    lock_values = Enum.map(servo_ids, fn id -> {id, 1} end)
+    Feetech.sync_write_raw(state.feetech, :lock, lock_values)
   end
 
+  defp buffer_goal_positions(feetech, servo_ids, positions) do
+    Enum.zip(servo_ids, positions)
+    |> Enum.each(fn {id, position_rad} ->
+      case Feetech.reg_write(feetech, id, :goal_position, position_rad) do
+        :ok -> :ok
+        {:ok, _} -> :ok
+        error -> Logger.warning("Servo #{id} reg_write failed: #{inspect(error)}")
+      end
+    end)
+  end
+
+  # --- Status polling ---
+
+  defp poll_status(%{servo_ids: []} = state), do: state
+
   defp poll_status(state) do
-    servo_ids = Map.keys(state.servo_registry)
+    servo_ids = state.servo_ids
 
     temp_results = read_status_param(state, servo_ids, :present_temperature)
     voltage_results = read_status_param(state, servo_ids, :present_voltage)
@@ -479,6 +510,8 @@ defmodule BB.Servo.Feetech.Controller do
       |> Enum.with_index()
       |> Enum.reduce(state.last_status, fn {servo_id, index}, acc ->
         status = build_status(index, temp_results, voltage_results, load_results, error_results)
+
+        write_servo_status(state.servo_table, servo_id, status)
 
         last = Map.get(acc, servo_id)
 
@@ -500,6 +533,15 @@ defmodule BB.Servo.Feetech.Controller do
       {:ok, values} -> values
       {:error, _} -> List.duplicate(nil, length(servo_ids))
     end
+  end
+
+  defp write_servo_status(table, servo_id, status) do
+    :ets.update_element(table, servo_id, [
+      {@idx_present_temperature, status.temperature},
+      {@idx_present_voltage, status.voltage},
+      {@idx_present_load, status.load},
+      {@idx_hardware_error, status.hardware_error}
+    ])
   end
 
   defp build_status(index, temp_results, voltage_results, load_results, error_results) do
@@ -554,6 +596,15 @@ defmodule BB.Servo.Feetech.Controller do
 
       {:error, reason} ->
         Logger.warning("Failed to create ServoStatus message: #{inspect(reason)}")
+    end
+  end
+
+  # --- Diagnostics ---
+
+  defp get_joint_name(state, servo_id) do
+    case :ets.lookup(state.servo_table, servo_id) do
+      [{^servo_id, joint_name, _, _, _, _, _, _, _, _, _, _, _}] -> joint_name
+      [] -> String.to_atom("servo_#{servo_id}")
     end
   end
 
