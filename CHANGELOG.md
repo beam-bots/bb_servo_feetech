@@ -11,6 +11,17 @@ See [Conventional Commits](Https://conventionalcommits.org) for commit guideline
 
 <!-- changelog -->
 
+## [v0.2.2](https://github.com/beam-bots/bb_servo_pca9685/compare/v0.2.1...v0.2.2) (2026-03-22)
+
+
+
+
+### Improvements:
+
+* controller: replace message-based writes with ETS-backed fixed-rate control loop (#20) by James Harton
+
+* actuator: add velocity/duration hints and trajectory command support by James Harton
+
 ## [v0.2.1](https://github.com/beam-bots/bb_servo_pca9685/compare/v0.2.0...v0.2.1) (2026-02-08)
 
 
