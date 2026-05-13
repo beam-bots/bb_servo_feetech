@@ -28,7 +28,11 @@ defmodule BB.Servo.Feetech.MixProject do
     ]
   end
 
-  defp dialyzer, do: []
+  defp dialyzer do
+    [
+      plt_add_apps: [:mix]
+    ]
+  end
 
   defp package do
     [
@@ -64,10 +68,19 @@ defmodule BB.Servo.Feetech.MixProject do
 
   defp aliases, do: []
 
+  defp bb_dep(default) do
+    case System.get_env("BB_VERSION") do
+      nil -> default
+      "local" -> [path: "../bb", override: true]
+      "main" -> [git: "https://github.com/beam-bots/bb.git", override: true]
+      version -> "~> #{version}"
+    end
+  end
+
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:bb, "~> 0.13"},
+      {:bb, bb_dep("~> 0.15.3")},
       {:feetech, "~> 0.2"},
 
       # dev/test
