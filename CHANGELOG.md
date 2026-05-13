@@ -11,6 +11,15 @@ See [Conventional Commits](Https://conventionalcommits.org) for commit guideline
 
 <!-- changelog -->
 
+## [v0.2.3](https://github.com/beam-bots/bb_servo_pca9685/compare/v0.2.2...v0.2.3) (2026-05-13)
+
+
+
+
+### Improvements:
+
+* add `bb_servo_feetech.install` igniter task (#25) by James Harton
+
 ## [v0.2.2](https://github.com/beam-bots/bb_servo_pca9685/compare/v0.2.1...v0.2.2) (2026-03-22)
 
 
