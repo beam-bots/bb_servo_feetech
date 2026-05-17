@@ -80,7 +80,7 @@ defmodule BB.Servo.Feetech.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:bb, bb_dep("~> 0.15.3")},
+      {:bb, bb_dep("~> 0.16")},
       {:feetech, "~> 0.2"},
 
       # dev/test
