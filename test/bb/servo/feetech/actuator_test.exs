@@ -41,7 +41,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       |> stub(:call, fn _robot, _controller, msg ->
         case msg do
           {:write, _id, :torque_enable, false} -> :ok
-          {:register_servo, _, _, _, _, _} -> {:ok, servo_table}
+          {:register_servo, _, _, _} -> {:ok, servo_table}
         end
       end)
 
@@ -58,7 +58,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
     test "initialises with valid revolute joint", %{servo_table: servo_table} do
       :ets.insert(
         servo_table,
-        {1, :shoulder, 0.0, false, 2, nil, nil, nil, nil, nil, nil, nil, nil}
+        {1, :shoulder, nil, 2, nil, nil, nil, nil, nil, nil, nil, nil}
       )
 
       opts = [
@@ -74,10 +74,9 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       assert state.name == :servo
       assert state.joint_name == :shoulder
       assert state.servo_table == servo_table
-      assert_in_delta state.lower_limit, -@pi / 2, 0.001
-      assert_in_delta state.upper_limit, @pi / 2, 0.001
-      assert_in_delta state.center_angle, 0.0, 0.001
-      assert_in_delta state.range, @pi, 0.001
+      assert_in_delta state.motor_lower, -@pi / 2, 0.001
+      assert_in_delta state.motor_upper, @pi / 2, 0.001
+      assert_in_delta state.motor_velocity_limit, @pi / 3, 0.001
       assert is_nil(state.trajectory)
       assert is_nil(state.trajectory_timer)
     end
@@ -101,8 +100,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       |> expect(:call, fn TestRobot, :feetech, {:write, 1, :torque_enable, false} -> :ok end)
       |> expect(:call, fn TestRobot,
                           :feetech,
-                          {:register_servo, 1, :shoulder, center, 2, false} ->
-        assert_in_delta center, 0.0, 0.001
+                          {:register_servo, 1, :shoulder, 2} ->
         {:ok, servo_table}
       end)
 
@@ -189,7 +187,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       assert {:noreply, _new_state} =
                Actuator.handle_info({:bb, [:actuator, :shoulder, :servo], msg}, state)
 
-      [{1, _, _, _, _, _, _, _, _, _, _, goal_position, goal_speed}] = :ets.lookup(servo_table, 1)
+      [{1, _, _, _, _, _, _, _, _, _, goal_position, goal_speed}] = :ets.lookup(servo_table, 1)
       assert goal_position == 2048
       assert goal_speed == 0
     end
@@ -204,7 +202,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       assert {:noreply, _new_state} =
                Actuator.handle_info({:bb, [:actuator, :shoulder, :servo], msg}, state)
 
-      [{1, _, _, _, _, _, _, _, _, _, _, goal_position, _}] = :ets.lookup(servo_table, 1)
+      [{1, _, _, _, _, _, _, _, _, _, goal_position, _}] = :ets.lookup(servo_table, 1)
       # pi/4 radians = 45 degrees = 512 steps from center
       # 2048 + 512 = 2560
       assert_in_delta goal_position, 2560, 1
@@ -220,26 +218,12 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       assert {:noreply, _new_state} =
                Actuator.handle_info({:bb, [:actuator, :shoulder, :servo], msg}, state)
 
-      [{1, _, _, _, _, _, _, _, _, _, _, goal_position, _}] = :ets.lookup(servo_table, 1)
+      [{1, _, _, _, _, _, _, _, _, _, goal_position, _}] = :ets.lookup(servo_table, 1)
       # -pi/4 radians = -45 degrees = -512 steps from center
       # 2048 - 512 = 1536
       assert_in_delta goal_position, 1536, 1
     end
 
-    test "reverses direction when reverse? is true", %{state: state, servo_table: servo_table} do
-      state = %{state | reverse?: true}
-
-      cmd = %Command.Position{position: @pi / 4}
-      msg = %Message{payload: cmd}
-
-      assert {:noreply, _new_state} =
-               Actuator.handle_info({:bb, [:actuator, :shoulder, :servo], msg}, state)
-
-      [{1, _, _, _, _, _, _, _, _, _, _, goal_position, _}] = :ets.lookup(servo_table, 1)
-      # With reverse, positive angle should give lower position
-      # pi/4 should give 2048 - 512 = 1536
-      assert_in_delta goal_position, 1536, 1
-    end
   end
 
   describe "position clamping" do
@@ -252,9 +236,9 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       {:noreply, new_state} =
         Actuator.handle_info({:bb, [:actuator, :shoulder, :servo], msg}, state)
 
-      assert_in_delta new_state.current_angle, @pi / 2, 0.001
+      assert_in_delta new_state.current_motor_angle, @pi / 2, 0.001
 
-      [{1, _, _, _, _, _, _, _, _, _, _, goal_position, _}] = :ets.lookup(servo_table, 1)
+      [{1, _, _, _, _, _, _, _, _, _, goal_position, _}] = :ets.lookup(servo_table, 1)
       # Position should be clamped to upper limit (pi/2)
       # pi/2 = 1024 steps from center = 2048 + 1024 = 3072
       assert_in_delta goal_position, 3072, 1
@@ -267,9 +251,9 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       {:noreply, new_state} =
         Actuator.handle_info({:bb, [:actuator, :shoulder, :servo], msg}, state)
 
-      assert_in_delta new_state.current_angle, -@pi / 2, 0.001
+      assert_in_delta new_state.current_motor_angle, -@pi / 2, 0.001
 
-      [{1, _, _, _, _, _, _, _, _, _, _, goal_position, _}] = :ets.lookup(servo_table, 1)
+      [{1, _, _, _, _, _, _, _, _, _, goal_position, _}] = :ets.lookup(servo_table, 1)
       # Position should be clamped to lower limit (-pi/2)
       # -pi/2 = -1024 steps from center = 2048 - 1024 = 1024
       assert_in_delta goal_position, 1024, 1
@@ -364,7 +348,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       assert {:noreply, _state} =
                Actuator.handle_info({:bb, [:actuator, :shoulder, :servo], msg}, state)
 
-      [{1, _, _, _, _, _, _, _, _, _, _, _, goal_speed}] = :ets.lookup(servo_table, 1)
+      [{1, _, _, _, _, _, _, _, _, _, _, goal_speed}] = :ets.lookup(servo_table, 1)
       assert_in_delta goal_speed, 1.0, 0.001
     end
 
@@ -395,7 +379,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       assert {:noreply, _state} =
                Actuator.handle_info({:bb, [:actuator, :shoulder, :servo], msg}, state)
 
-      [{1, _, _, _, _, _, _, _, _, _, _, _, goal_speed}] = :ets.lookup(servo_table, 1)
+      [{1, _, _, _, _, _, _, _, _, _, _, goal_speed}] = :ets.lookup(servo_table, 1)
       assert goal_speed == 0
     end
   end
@@ -413,7 +397,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       assert {:noreply, _state} =
                Actuator.handle_info({:bb, [:actuator, :shoulder, :servo], msg}, state)
 
-      [{1, _, _, _, _, _, _, _, _, _, _, _, goal_speed}] = :ets.lookup(servo_table, 1)
+      [{1, _, _, _, _, _, _, _, _, _, _, goal_speed}] = :ets.lookup(servo_table, 1)
       # Moving 0.5 rad in 500ms → velocity = 0.5 / 0.5 = 1.0 rad/s
       assert_in_delta goal_speed, 1.0, 0.001
     end
@@ -443,7 +427,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       assert {:noreply, _state} =
                Actuator.handle_info({:bb, [:actuator, :shoulder, :servo], msg}, state)
 
-      [{1, _, _, _, _, _, _, _, _, _, _, _, goal_speed}] = :ets.lookup(servo_table, 1)
+      [{1, _, _, _, _, _, _, _, _, _, _, goal_speed}] = :ets.lookup(servo_table, 1)
       assert_in_delta goal_speed, 2.0, 0.001
     end
   end
@@ -466,9 +450,9 @@ defmodule BB.Servo.Feetech.ActuatorTest do
 
       assert new_state.trajectory != nil
       assert new_state.trajectory.index == 0
-      assert_in_delta new_state.current_angle, 0.5, 0.001
+      assert_in_delta new_state.current_motor_angle, 0.5, 0.001
 
-      [{1, _, _, _, _, _, _, _, _, _, _, goal_position, goal_speed}] = :ets.lookup(servo_table, 1)
+      [{1, _, _, _, _, _, _, _, _, _, goal_position, goal_speed}] = :ets.lookup(servo_table, 1)
       assert goal_position != nil
       assert_in_delta goal_speed, 1.0, 0.001
     end
@@ -506,9 +490,9 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       {:noreply, new_state} =
         Actuator.handle_info({:bb, [:actuator, :shoulder, :servo], msg}, state)
 
-      assert_in_delta new_state.current_angle, @pi / 2, 0.001
+      assert_in_delta new_state.current_motor_angle, @pi / 2, 0.001
 
-      [{1, _, _, _, _, _, _, _, _, _, _, goal_position, _}] = :ets.lookup(servo_table, 1)
+      [{1, _, _, _, _, _, _, _, _, _, goal_position, _}] = :ets.lookup(servo_table, 1)
       # pi should be clamped to pi/2 = 3072
       assert_in_delta goal_position, 3072, 1
     end
@@ -549,15 +533,15 @@ defmodule BB.Servo.Feetech.ActuatorTest do
         Actuator.handle_info({:bb, [:actuator, :shoulder, :servo], msg}, state)
 
       assert state.trajectory.index == 0
-      assert_in_delta state.current_angle, 0.2, 0.001
+      assert_in_delta state.current_motor_angle, 0.2, 0.001
 
       {:noreply, state} = Actuator.handle_info(:trajectory_next, state)
       assert state.trajectory.index == 1
-      assert_in_delta state.current_angle, 0.4, 0.001
+      assert_in_delta state.current_motor_angle, 0.4, 0.001
 
       {:noreply, state} = Actuator.handle_info(:trajectory_next, state)
       assert state.trajectory.index == 2
-      assert_in_delta state.current_angle, 0.6, 0.001
+      assert_in_delta state.current_motor_angle, 0.6, 0.001
 
       {:noreply, state} = Actuator.handle_info(:trajectory_next, state)
       assert is_nil(state.trajectory)
@@ -622,7 +606,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
         )
 
       assert state_with_second.trajectory != nil
-      assert_in_delta state_with_second.current_angle, 0.6, 0.001
+      assert_in_delta state_with_second.current_motor_angle, 0.6, 0.001
     end
   end
 
@@ -688,22 +672,20 @@ defmodule BB.Servo.Feetech.ActuatorTest do
 
     :ets.insert(
       servo_table,
-      {1, :shoulder, 0.0, false, 2, nil, nil, nil, nil, nil, nil, nil, nil}
+      {1, :shoulder, nil, 2, nil, nil, nil, nil, nil, nil, nil, nil}
     )
 
     state = %State{
       bb: %{robot: TestRobot, path: [:shoulder, :servo]},
-      center_angle: 0.0,
       controller: :feetech,
-      current_angle: 0.0,
+      current_motor_angle: 0.0,
       joint_name: :shoulder,
-      lower_limit: -@pi / 2,
+      motor_lower: -@pi / 2,
+      motor_upper: @pi / 2,
+      motor_velocity_limit: @pi / 3,
       name: :servo,
-      range: @pi,
       servo_id: 1,
-      servo_table: servo_table,
-      upper_limit: @pi / 2,
-      velocity_limit: @pi / 3
+      servo_table: servo_table
     }
 
     BB.Safety
@@ -724,22 +706,20 @@ defmodule BB.Servo.Feetech.ActuatorTest do
 
     :ets.insert(
       servo_table,
-      {1, :shoulder, 0.0, false, 2, nil, nil, nil, nil, nil, nil, nil, nil}
+      {1, :shoulder, nil, 2, nil, nil, nil, nil, nil, nil, nil, nil}
     )
 
     state = %State{
       bb: %{robot: TestRobot, path: [:shoulder, :servo]},
-      center_angle: 0.0,
       controller: :feetech,
-      current_angle: 0.0,
+      current_motor_angle: 0.0,
       joint_name: :shoulder,
-      lower_limit: -@pi / 2,
+      motor_lower: -@pi / 2,
+      motor_upper: @pi / 2,
+      motor_velocity_limit: @pi / 3,
       name: :servo,
-      range: @pi,
       servo_id: 1,
-      servo_table: servo_table,
-      upper_limit: @pi / 2,
-      velocity_limit: @pi / 3
+      servo_table: servo_table
     }
 
     BB.Safety

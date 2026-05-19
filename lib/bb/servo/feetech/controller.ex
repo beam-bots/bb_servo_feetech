@@ -46,11 +46,13 @@ defmodule BB.Servo.Feetech.Controller do
 
   Each registered servo has a row in the ETS table:
 
-      {servo_id, joint_name, center_angle, reverse?, position_deadband,
+      {servo_id, joint_name, transmission, position_deadband,
        last_position_raw, goal_position, goal_speed}
 
-  Actuators write `goal_position` (raw units) and `goal_speed` (rad/s) via
-  `:ets.update_element/3`. The controller reads and clears them each tick.
+  Actuators write `goal_position` (raw motor units) and `goal_speed` (motor
+  rad/s) via `:ets.update_element/3`. The controller reads and clears them
+  each tick and applies `BB.Transmission.unapply_position/2` to encoder
+  readings before publishing joint-space `JointState`.
 
   ## Safety
 
@@ -103,14 +105,14 @@ defmodule BB.Servo.Feetech.Controller do
   @position_resolution 4096
 
   # ETS tuple field indices (positions 2-5 are config, matched via pattern)
-  @idx_last_position_raw 6
-  @idx_present_position 7
-  @idx_present_temperature 8
-  @idx_present_voltage 9
-  @idx_present_load 10
-  @idx_hardware_error 11
-  @idx_goal_position 12
-  @idx_goal_speed 13
+  @idx_last_position_raw 5
+  @idx_present_position 6
+  @idx_present_temperature 7
+  @idx_present_voltage 8
+  @idx_present_load 9
+  @idx_hardware_error 10
+  @idx_goal_position 11
+  @idx_goal_speed 12
 
   # Diagnostic thresholds (Feetech servos typically run on 6-7.4V)
   @temp_warning_threshold 55.0
@@ -212,15 +214,17 @@ defmodule BB.Servo.Feetech.Controller do
 
   @impl BB.Controller
   def handle_call(
-        {:register_servo, servo_id, joint_name, center_angle, position_deadband, reverse?},
+        {:register_servo, servo_id, joint_name, position_deadband},
         _from,
         state
       ) do
+    {transmission, _subs} =
+      BB.Transmission.Resolver.resolve_and_subscribe(state.bb.robot, joint_name)
+
     :ets.insert(state.servo_table, {
       servo_id,
       joint_name,
-      center_angle,
-      reverse?,
+      transmission,
       position_deadband,
       _last_position_raw = nil,
       _present_position = nil,
@@ -328,7 +332,7 @@ defmodule BB.Servo.Feetech.Controller do
     entries = :ets.tab2list(state.servo_table)
 
     commands =
-      for {id, _, _, _, _, _, _, _, _, _, _, goal_pos, goal_speed} <- entries,
+      for {id, _, _, _, _, _, _, _, _, _, goal_pos, goal_speed} <- entries,
           goal_pos != nil,
           do: {id, goal_pos, goal_speed || 0}
 
@@ -397,11 +401,11 @@ defmodule BB.Servo.Feetech.Controller do
   defp maybe_publish_position(state, servo_id, position_rad) do
     case :ets.lookup(state.servo_table, servo_id) do
       [
-        {^servo_id, joint_name, center_angle, reverse?, position_deadband, last_position_raw, _,
+        {^servo_id, joint_name, transmission, position_deadband, last_position_raw, _,
          _, _, _, _, _, _}
       ] ->
         if should_publish_position?(position_rad, last_position_raw, position_deadband) do
-          joint_angle = radians_to_joint_angle(position_rad, center_angle, reverse?)
+          joint_angle = motor_position_to_joint_angle(position_rad, transmission)
           publish_joint_state(state, joint_name, joint_angle)
 
           :ets.update_element(state.servo_table, servo_id, [
@@ -433,18 +437,16 @@ defmodule BB.Servo.Feetech.Controller do
     abs(position_rad - last_rad) >= deadband_rad
   end
 
-  defp radians_to_joint_angle(position_rad, center_angle, reverse?) do
-    servo_center_rad = :math.pi()
-    servo_offset_rad = position_rad - servo_center_rad
+  # The Feetech servo reads back an absolute position in [0, 2π) radians,
+  # with the hardware centre at π. Convert to motor-space radians (centred at
+  # zero) and then unapply the transmission to recover the joint angle.
+  defp motor_position_to_joint_angle(position_rad, nil) do
+    position_rad - :math.pi()
+  end
 
-    joint_offset_rad =
-      if reverse? do
-        -servo_offset_rad
-      else
-        servo_offset_rad
-      end
-
-    center_angle + joint_offset_rad
+  defp motor_position_to_joint_angle(position_rad, transmission) do
+    motor_rad = position_rad - :math.pi()
+    BB.Transmission.unapply_position(motor_rad, transmission)
   end
 
   defp publish_joint_state(state, joint_name, position_rad) do
@@ -603,7 +605,7 @@ defmodule BB.Servo.Feetech.Controller do
 
   defp get_joint_name(state, servo_id) do
     case :ets.lookup(state.servo_table, servo_id) do
-      [{^servo_id, joint_name, _, _, _, _, _, _, _, _, _, _, _}] -> joint_name
+      [{^servo_id, joint_name, _, _, _, _, _, _, _, _, _, _}] -> joint_name
       [] -> String.to_atom("servo_#{servo_id}")
     end
   end

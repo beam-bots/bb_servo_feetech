@@ -50,11 +50,6 @@ defmodule BB.Servo.Feetech.Actuator do
         doc: "Name of the Feetech controller in the robot's registry",
         required: true
       ],
-      reverse?: [
-        type: :boolean,
-        doc: "Reverse the servo rotation direction?",
-        default: false
-      ],
       position_deadband: [
         type: :non_neg_integer,
         doc:
@@ -63,11 +58,13 @@ defmodule BB.Servo.Feetech.Actuator do
       ]
     ]
 
+  alias BB.Actuator, as: ActuatorApi
   alias BB.Error.Invalid.JointConfig, as: JointConfigError
   alias BB.Message
   alias BB.Message.Actuator.BeginMotion
   alias BB.Message.Actuator.Command
   alias BB.Process, as: BBProcess
+  alias BB.Transmission
 
   require Logger
 
@@ -75,21 +72,18 @@ defmodule BB.Servo.Feetech.Actuator do
     @moduledoc false
     defstruct [
       :bb,
-      :center_angle,
       :controller,
-      :current_angle,
+      :current_motor_angle,
       :joint_name,
-      :lower_limit,
+      :motor_lower,
+      :motor_upper,
+      :motor_velocity_limit,
       :name,
-      :range,
       :servo_id,
       :servo_table,
       :trajectory,
       :trajectory_timer,
-      :upper_limit,
-      :velocity_limit,
-      position_deadband: 2,
-      reverse?: false
+      position_deadband: 2
     ]
   end
 
@@ -97,8 +91,8 @@ defmodule BB.Servo.Feetech.Actuator do
   @position_center 2048
 
   # ETS tuple field indices for command writes
-  @ets_idx_goal_position 12
-  @ets_idx_goal_speed 13
+  @ets_idx_goal_position 11
+  @ets_idx_goal_speed 12
 
   @doc """
   Safety disarm callback.
@@ -128,36 +122,44 @@ defmodule BB.Servo.Feetech.Actuator do
     opts = Map.new(opts)
     [name, joint_name | _] = Enum.reverse(opts.bb.path)
     robot = opts.bb.robot.robot()
-
-    reverse? = Map.get(opts, :reverse?, false)
     position_deadband = Map.get(opts, :position_deadband, 2)
+    transmission = ActuatorApi.current_transmission()
 
     with {:ok, joint} <- fetch_joint(robot, joint_name),
          {:ok, limits} <- validate_joint_limits(joint, joint_name) do
-      lower_limit = limits.lower
-      upper_limit = limits.upper
-      range = upper_limit - lower_limit
-      center_angle = (lower_limit + upper_limit) / 2
-      velocity_limit = limits.velocity
+      {motor_lower, motor_upper} = motor_position_limits(limits, transmission)
+      motor_velocity_limit = motor_velocity_limit(limits.velocity, transmission)
+      current_motor_angle = (motor_lower + motor_upper) / 2
 
       state = %State{
         bb: opts.bb,
-        center_angle: center_angle,
         controller: opts.controller,
-        current_angle: center_angle,
+        current_motor_angle: current_motor_angle,
         joint_name: joint_name,
-        lower_limit: lower_limit,
+        motor_lower: motor_lower,
+        motor_upper: motor_upper,
+        motor_velocity_limit: motor_velocity_limit,
         name: name,
         position_deadband: position_deadband,
-        range: range,
-        reverse?: reverse?,
-        servo_id: opts.servo_id,
-        upper_limit: upper_limit,
-        velocity_limit: velocity_limit
+        servo_id: opts.servo_id
       }
 
       {:ok, state}
     end
+  end
+
+  defp motor_position_limits(limits, nil), do: {limits.lower, limits.upper}
+
+  defp motor_position_limits(limits, transmission) do
+    a = Transmission.apply_position(limits.lower, transmission)
+    b = Transmission.apply_position(limits.upper, transmission)
+    {min(a, b), max(a, b)}
+  end
+
+  defp motor_velocity_limit(velocity, nil), do: velocity
+
+  defp motor_velocity_limit(velocity, transmission) do
+    abs(Transmission.apply_rate(velocity, transmission))
   end
 
   defp fetch_joint(robot, joint_name) do
@@ -232,8 +234,7 @@ defmodule BB.Servo.Feetech.Actuator do
     BBProcess.call(
       state.bb.robot,
       state.controller,
-      {:register_servo, state.servo_id, state.joint_name, state.center_angle,
-       state.position_deadband, state.reverse?}
+      {:register_servo, state.servo_id, state.joint_name, state.position_deadband}
     )
   end
 
@@ -303,20 +304,20 @@ defmodule BB.Servo.Feetech.Actuator do
 
   defp do_set_position(%Command.Position{} = cmd, state) do
     state = cancel_trajectory(state)
-    clamped_angle = clamp_angle(cmd.position, state)
+    clamped_motor_angle = clamp_motor_angle(cmd.position, state)
 
-    goal_speed = compute_goal_speed(cmd, clamped_angle, state)
-    goal_position = angle_to_position(clamped_angle, state)
+    goal_speed = compute_goal_speed(cmd, clamped_motor_angle, state)
+    goal_position = motor_angle_to_position(clamped_motor_angle)
 
     write_servo_command(state, goal_position, goal_speed)
 
-    travel_time_ms = estimate_travel_time_ms(cmd, clamped_angle, state)
+    travel_time_ms = estimate_travel_time_ms(cmd, clamped_motor_angle, state)
     expected_arrival = System.monotonic_time(:millisecond) + travel_time_ms
 
     message_opts =
       [
-        initial_position: state.current_angle,
-        target_position: clamped_angle,
+        initial_position: state.current_motor_angle,
+        target_position: clamped_motor_angle,
         expected_arrival: expected_arrival,
         command_type: :position
       ]
@@ -326,16 +327,16 @@ defmodule BB.Servo.Feetech.Actuator do
 
     BB.publish(state.bb.robot, [:actuator | state.bb.path], message)
 
-    {:noreply, %{state | current_angle: clamped_angle}}
+    {:noreply, %{state | current_motor_angle: clamped_motor_angle}}
   end
 
   defp compute_goal_speed(%Command.Position{velocity: velocity}, _clamped_angle, _state)
        when is_number(velocity),
-       do: velocity
+       do: abs(velocity)
 
-  defp compute_goal_speed(%Command.Position{duration: duration}, clamped_angle, state)
+  defp compute_goal_speed(%Command.Position{duration: duration}, clamped_motor_angle, state)
        when is_integer(duration) and duration > 0 do
-    travel_distance = abs(state.current_angle - clamped_angle)
+    travel_distance = abs(state.current_motor_angle - clamped_motor_angle)
     travel_distance / (duration / 1000)
   end
 
@@ -350,10 +351,10 @@ defmodule BB.Servo.Feetech.Actuator do
     ArgumentError -> false
   end
 
-  defp estimate_travel_time_ms(%Command.Position{velocity: velocity}, clamped_angle, state)
+  defp estimate_travel_time_ms(%Command.Position{velocity: velocity}, clamped_motor_angle, state)
        when is_number(velocity) and velocity > 0 do
-    travel_distance = abs(state.current_angle - clamped_angle)
-    round(travel_distance / velocity * 1000)
+    travel_distance = abs(state.current_motor_angle - clamped_motor_angle)
+    round(travel_distance / abs(velocity) * 1000)
   end
 
   defp estimate_travel_time_ms(%Command.Position{duration: duration}, _clamped_angle, _state)
@@ -361,9 +362,9 @@ defmodule BB.Servo.Feetech.Actuator do
     duration
   end
 
-  defp estimate_travel_time_ms(_cmd, clamped_angle, state) do
-    travel_distance = abs(state.current_angle - clamped_angle)
-    round(travel_distance / state.velocity_limit * 1000)
+  defp estimate_travel_time_ms(_cmd, clamped_motor_angle, state) do
+    travel_distance = abs(state.current_motor_angle - clamped_motor_angle)
+    round(travel_distance / state.motor_velocity_limit * 1000)
   end
 
   # --- Trajectory commands ---
@@ -384,7 +385,7 @@ defmodule BB.Servo.Feetech.Actuator do
 
     message_opts =
       [
-        initial_position: state.current_angle,
+        initial_position: state.current_motor_angle,
         target_position: hd(waypoints)[:position],
         expected_arrival: expected_arrival,
         command_type: :trajectory
@@ -432,13 +433,13 @@ defmodule BB.Servo.Feetech.Actuator do
 
   defp execute_and_schedule(trajectory, state) do
     waypoint = Enum.at(trajectory.waypoints, trajectory.index)
-    velocity = waypoint[:velocity] || 0
-    clamped_angle = clamp_angle(waypoint[:position], state)
+    velocity = abs(waypoint[:velocity] || 0)
+    clamped_motor_angle = clamp_motor_angle(waypoint[:position], state)
 
-    goal_position = angle_to_position(clamped_angle, state)
+    goal_position = motor_angle_to_position(clamped_motor_angle)
     write_servo_command(state, goal_position, velocity)
 
-    state = %{state | current_angle: clamped_angle}
+    state = %{state | current_motor_angle: clamped_motor_angle}
 
     next_index = trajectory.index + 1
 
@@ -465,24 +466,19 @@ defmodule BB.Servo.Feetech.Actuator do
   defp maybe_add_opt(opts, _key, nil), do: opts
   defp maybe_add_opt(opts, key, value), do: Keyword.put(opts, key, value)
 
-  defp clamp_angle(angle, state) do
-    angle
-    |> max(state.lower_limit)
-    |> min(state.upper_limit)
+  defp clamp_motor_angle(motor_angle, state) do
+    motor_angle
+    |> max(state.motor_lower)
+    |> min(state.motor_upper)
   end
 
-  defp angle_to_position(angle_rad, state) do
-    offset_rad = angle_rad - state.center_angle
-    offset_units = offset_rad / (2 * :math.pi()) * @position_resolution
+  # The Feetech servo encoder is 0..@position_resolution-1, mapped linearly to
+  # one full motor rotation. Encoder centre (@position_center) corresponds to
+  # motor zero. Negative motor angles map to below centre, positive to above.
+  defp motor_angle_to_position(motor_angle_rad) do
+    offset_units = motor_angle_rad / (2 * :math.pi()) * @position_resolution
 
-    position =
-      if state.reverse? do
-        @position_center - offset_units
-      else
-        @position_center + offset_units
-      end
-
-    round(position)
+    round(@position_center + offset_units)
     |> max(0)
     |> min(@position_resolution - 1)
   end
