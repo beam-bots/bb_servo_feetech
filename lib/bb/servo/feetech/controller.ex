@@ -212,14 +212,16 @@ defmodule BB.Servo.Feetech.Controller do
 
   # --- Handle calls ---
 
+  alias BB.Transmission
+  alias BB.Transmission.Resolver, as: TransmissionResolver
+
   @impl BB.Controller
   def handle_call(
         {:register_servo, servo_id, joint_name, position_deadband},
         _from,
         state
       ) do
-    {transmission, _subs} =
-      BB.Transmission.Resolver.resolve_and_subscribe(state.bb.robot, joint_name)
+    {transmission, _subs} = TransmissionResolver.resolve_and_subscribe(state.bb.robot, joint_name)
 
     :ets.insert(state.servo_table, {
       servo_id,
@@ -446,7 +448,7 @@ defmodule BB.Servo.Feetech.Controller do
 
   defp motor_position_to_joint_angle(position_rad, transmission) do
     motor_rad = position_rad - :math.pi()
-    BB.Transmission.unapply_position(motor_rad, transmission)
+    Transmission.unapply_position(motor_rad, transmission)
   end
 
   defp publish_joint_state(state, joint_name, position_rad) do

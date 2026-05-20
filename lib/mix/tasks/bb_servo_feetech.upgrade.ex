@@ -22,6 +22,8 @@ if Code.ensure_loaded?(Igniter) do
 
     use Igniter.Mix.Task
 
+    alias BB.Igniter.Transmission
+
     @impl Igniter.Mix.Task
     def info(_argv, _parent) do
       %Igniter.Mix.Task.Info{}
@@ -29,7 +31,7 @@ if Code.ensure_loaded?(Igniter) do
 
     @impl Igniter.Mix.Task
     def igniter(igniter) do
-      BB.Igniter.Transmission.lift_reverse_question(
+      Transmission.lift_reverse_question(
         igniter,
         BB.Servo.Feetech.Actuator,
         lift_offset?: true
