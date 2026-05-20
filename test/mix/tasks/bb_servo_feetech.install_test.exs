@@ -105,5 +105,21 @@ defmodule Mix.Tasks.BbServoFeetech.InstallTest do
       |> Igniter.compose_task("bb_servo_feetech.install")
       |> assert_unchanged()
     end
+
+    test "skips when a Feetech controller is already present under a different name" do
+      project_with_robot()
+      |> Igniter.compose_task("bb_servo_feetech.install", ["--name", "feetech_controller"])
+      |> apply_igniter!()
+      |> Igniter.compose_task("bb_servo_feetech.install")
+      |> assert_unchanged()
+    end
+
+    test "prints a notice when skipping a duplicate install" do
+      project_with_robot()
+      |> Igniter.compose_task("bb_servo_feetech.install", ["--name", "feetech_controller"])
+      |> apply_igniter!()
+      |> Igniter.compose_task("bb_servo_feetech.install")
+      |> assert_has_notice(&String.contains?(&1, "already has a BB.Servo.Feetech.Controller"))
+    end
   end
 end
