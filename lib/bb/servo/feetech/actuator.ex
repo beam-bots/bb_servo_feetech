@@ -6,9 +6,11 @@ defmodule BB.Servo.Feetech.Actuator do
   @moduledoc """
   An actuator that uses a Feetech controller to drive a serial bus servo.
 
-  This actuator derives its configuration from the joint constraints defined in the robot:
-  - Position limits from `joint.limits.lower` and `joint.limits.upper`
-  - Velocity limit from `joint.limits.velocity`
+  Configuration is derived from the joint's `motor_profile` injected by
+  `BB.Actuator.Server`:
+
+  - Position limits from `motor_profile.motor_lower` / `motor_upper`
+  - Velocity limit from `motor_profile.motor_velocity_limit`
   - Position range maps to the servo's goal_position register
 
   When initialised, the actuator:
@@ -17,10 +19,12 @@ defmodule BB.Servo.Feetech.Actuator do
   3. Subscribes to position commands
 
   When a position command is received, the actuator:
-  1. Clamps the position to joint limits
+  1. Clamps the position to motor limits
   2. Converts to servo position units (0-4095 for 360 degrees)
   3. Writes goal_position and goal_speed to the controller's ETS table
-  4. Publishes a `BB.Message.Actuator.BeginMotion` message
+  4. Publishes a `BB.Message.Actuator.BeginMotion` via
+     `BB.Actuator.publish_begin_motion/3` (which handles the
+     motor → joint-space conversion)
 
   The controller picks up pending commands on its next loop tick and batches them
   into efficient `sync_write` operations on the serial bus.
@@ -58,13 +62,10 @@ defmodule BB.Servo.Feetech.Actuator do
       ]
     ]
 
-  alias BB.Actuator, as: ActuatorApi
   alias BB.Error.Invalid.JointConfig, as: JointConfigError
   alias BB.Message
-  alias BB.Message.Actuator.BeginMotion
   alias BB.Message.Actuator.Command
   alias BB.Process, as: BBProcess
-  alias BB.Transmission
 
   require Logger
 
@@ -75,9 +76,7 @@ defmodule BB.Servo.Feetech.Actuator do
       :controller,
       :current_motor_angle,
       :joint_name,
-      :motor_lower,
-      :motor_upper,
-      :motor_velocity_limit,
+      :motor_profile,
       :name,
       :servo_id,
       :servo_table,
@@ -91,8 +90,8 @@ defmodule BB.Servo.Feetech.Actuator do
   @position_center 2048
 
   # ETS tuple field indices for command writes
-  @ets_idx_goal_position 11
-  @ets_idx_goal_speed 12
+  @ets_idx_goal_position 10
+  @ets_idx_goal_speed 11
 
   @doc """
   Safety disarm callback.
@@ -118,29 +117,32 @@ defmodule BB.Servo.Feetech.Actuator do
     end
   end
 
+  @impl BB.Actuator
+  def handle_options(new_opts, state) do
+    motor_profile = Keyword.fetch!(new_opts, :motor_profile)
+
+    {:ok,
+     %{
+       state
+       | motor_profile: motor_profile,
+         current_motor_angle: clamp_motor_angle(state.current_motor_angle, motor_profile)
+     }}
+  end
+
   defp build_state(opts) do
     opts = Map.new(opts)
     [name, joint_name | _] = Enum.reverse(opts.bb.path)
-    robot = opts.bb.robot.robot()
-    position_deadband = Map.get(opts, :position_deadband, 2)
-    transmission = ActuatorApi.current_transmission()
+    motor_profile = opts.motor_profile
 
-    with {:ok, joint} <- fetch_joint(robot, joint_name),
-         {:ok, limits} <- validate_joint_limits(joint, joint_name) do
-      {motor_lower, motor_upper} = motor_position_limits(limits, transmission)
-      motor_velocity_limit = motor_velocity_limit(limits.velocity, transmission)
-      current_motor_angle = (motor_lower + motor_upper) / 2
-
+    with :ok <- validate_motor_profile(motor_profile, joint_name) do
       state = %State{
         bb: opts.bb,
         controller: opts.controller,
-        current_motor_angle: current_motor_angle,
+        current_motor_angle: motor_profile.motor_initial_position,
         joint_name: joint_name,
-        motor_lower: motor_lower,
-        motor_upper: motor_upper,
-        motor_velocity_limit: motor_velocity_limit,
+        motor_profile: motor_profile,
         name: name,
-        position_deadband: position_deadband,
+        position_deadband: Map.get(opts, :position_deadband, 2),
         servo_id: opts.servo_id
       }
 
@@ -148,75 +150,37 @@ defmodule BB.Servo.Feetech.Actuator do
     end
   end
 
-  defp motor_position_limits(limits, nil), do: {limits.lower, limits.upper}
-
-  defp motor_position_limits(limits, transmission) do
-    a = Transmission.apply_position(limits.lower, transmission)
-    b = Transmission.apply_position(limits.upper, transmission)
-    {min(a, b), max(a, b)}
-  end
-
-  defp motor_velocity_limit(velocity, nil), do: velocity
-
-  defp motor_velocity_limit(velocity, transmission) do
-    abs(Transmission.apply_rate(velocity, transmission))
-  end
-
-  defp fetch_joint(robot, joint_name) do
-    case BB.Robot.get_joint(robot, joint_name) do
-      nil ->
-        {:error,
-         %JointConfigError{joint: joint_name, field: nil, message: "Joint not found in robot"}}
-
-      joint ->
-        {:ok, joint}
-    end
-  end
-
-  defp validate_joint_limits(%{type: :continuous}, joint_name) do
-    {:error,
-     %JointConfigError{
-       joint: joint_name,
-       field: :type,
-       value: :continuous,
-       expected: [:revolute, :prismatic],
-       message: "Continuous joints require position limits for servo control"
-     }}
-  end
-
-  defp validate_joint_limits(%{limits: nil}, joint_name) do
-    {:error,
-     %JointConfigError{
-       joint: joint_name,
-       field: :limits,
-       value: nil,
-       message: "Joint must have limits defined for servo control"
-     }}
-  end
-
-  defp validate_joint_limits(%{limits: %{lower: nil}}, joint_name) do
+  defp validate_motor_profile(%{motor_lower: nil}, joint_name) do
     {:error,
      %JointConfigError{
        joint: joint_name,
        field: :lower,
        value: nil,
-       message: "Joint must have lower limit defined"
+       message: "Joint must have a lower limit defined for servo control"
      }}
   end
 
-  defp validate_joint_limits(%{limits: %{upper: nil}}, joint_name) do
+  defp validate_motor_profile(%{motor_upper: nil}, joint_name) do
     {:error,
      %JointConfigError{
        joint: joint_name,
        field: :upper,
        value: nil,
-       message: "Joint must have upper limit defined"
+       message: "Joint must have an upper limit defined for servo control"
      }}
   end
 
-  defp validate_joint_limits(%{limits: limits}, _joint_name) do
-    {:ok, limits}
+  defp validate_motor_profile(%{motor_velocity_limit: nil}, joint_name) do
+    {:error,
+     %JointConfigError{
+       joint: joint_name,
+       field: :velocity,
+       value: nil,
+       message: "Joint must have a velocity limit defined for servo control"
+     }}
   end
+
+  defp validate_motor_profile(_profile, _joint_name), do: :ok
 
   defp disable_torque(state) do
     case BBProcess.call(
@@ -234,7 +198,7 @@ defmodule BB.Servo.Feetech.Actuator do
     BBProcess.call(
       state.bb.robot,
       state.controller,
-      {:register_servo, state.servo_id, state.joint_name, state.position_deadband}
+      {:register_servo, state.servo_id, state.bb.path, state.position_deadband}
     )
   end
 
@@ -304,7 +268,7 @@ defmodule BB.Servo.Feetech.Actuator do
 
   defp do_set_position(%Command.Position{} = cmd, state) do
     state = cancel_trajectory(state)
-    clamped_motor_angle = clamp_motor_angle(cmd.position, state)
+    clamped_motor_angle = clamp_motor_angle(cmd.position, state.motor_profile)
 
     goal_speed = compute_goal_speed(cmd, clamped_motor_angle, state)
     goal_position = motor_angle_to_position(clamped_motor_angle)
@@ -323,9 +287,7 @@ defmodule BB.Servo.Feetech.Actuator do
       ]
       |> maybe_add_opt(:command_id, cmd.command_id)
 
-    message = Message.new!(BeginMotion, state.joint_name, message_opts)
-
-    BB.publish(state.bb.robot, [:actuator | state.bb.path], message)
+    BB.Actuator.publish_begin_motion(state.bb.robot, state.bb.path, message_opts)
 
     {:noreply, %{state | current_motor_angle: clamped_motor_angle}}
   end
@@ -364,7 +326,7 @@ defmodule BB.Servo.Feetech.Actuator do
 
   defp estimate_travel_time_ms(_cmd, clamped_motor_angle, state) do
     travel_distance = abs(state.current_motor_angle - clamped_motor_angle)
-    round(travel_distance / state.motor_velocity_limit * 1000)
+    round(travel_distance / state.motor_profile.motor_velocity_limit * 1000)
   end
 
   # --- Trajectory commands ---
@@ -392,8 +354,7 @@ defmodule BB.Servo.Feetech.Actuator do
       ]
       |> maybe_add_opt(:command_id, cmd.command_id)
 
-    message = Message.new!(BeginMotion, state.joint_name, message_opts)
-    BB.publish(state.bb.robot, [:actuator | state.bb.path], message)
+    BB.Actuator.publish_begin_motion(state.bb.robot, state.bb.path, message_opts)
 
     execute_and_schedule(trajectory, %{state | trajectory: trajectory})
   end
@@ -434,7 +395,7 @@ defmodule BB.Servo.Feetech.Actuator do
   defp execute_and_schedule(trajectory, state) do
     waypoint = Enum.at(trajectory.waypoints, trajectory.index)
     velocity = abs(waypoint[:velocity] || 0)
-    clamped_motor_angle = clamp_motor_angle(waypoint[:position], state)
+    clamped_motor_angle = clamp_motor_angle(waypoint[:position], state.motor_profile)
 
     goal_position = motor_angle_to_position(clamped_motor_angle)
     write_servo_command(state, goal_position, velocity)
@@ -466,10 +427,10 @@ defmodule BB.Servo.Feetech.Actuator do
   defp maybe_add_opt(opts, _key, nil), do: opts
   defp maybe_add_opt(opts, key, value), do: Keyword.put(opts, key, value)
 
-  defp clamp_motor_angle(motor_angle, state) do
+  defp clamp_motor_angle(motor_angle, %{motor_lower: lower, motor_upper: upper}) do
     motor_angle
-    |> max(state.motor_lower)
-    |> min(state.motor_upper)
+    |> max(lower)
+    |> min(upper)
   end
 
   # The Feetech servo encoder is 0..@position_resolution-1, mapped linearly to
