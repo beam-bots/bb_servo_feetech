@@ -195,7 +195,7 @@ defmodule BB.Servo.Feetech.ControllerTest do
         :ok
       end)
 
-      message = {:register_servo, 1, :shoulder, 0.0, 2, false}
+      message = {:register_servo, 1, [:shoulder, :servo], 2}
 
       assert {:reply, {:ok, servo_table}, new_state} =
                Controller.handle_call(message, {self(), make_ref()}, state)
@@ -204,14 +204,12 @@ defmodule BB.Servo.Feetech.ControllerTest do
       assert new_state.servo_ids == [1]
 
       [
-        {1, joint_name, center_angle, reverse?, deadband, last_pos, present_pos, present_temp,
-         present_voltage, present_load, hw_error, goal_pos, goal_speed}
+        {1, actuator_path, deadband, last_pos, present_pos, present_temp, present_voltage,
+         present_load, hw_error, goal_pos, goal_speed}
       ] =
         :ets.lookup(state.servo_table, 1)
 
-      assert joint_name == :shoulder
-      assert center_angle == 0.0
-      assert reverse? == false
+      assert actuator_path == [:shoulder, :servo]
       assert deadband == 2
       assert last_pos == nil
       assert present_pos == nil
@@ -224,18 +222,20 @@ defmodule BB.Servo.Feetech.ControllerTest do
     end
 
     test "registers multiple servos", %{state: state} do
-      message1 = {:register_servo, 1, :shoulder, 0.0, 2, false}
+      message1 = {:register_servo, 1, [:shoulder, :servo], 2}
       {:reply, {:ok, _}, state} = Controller.handle_call(message1, {self(), make_ref()}, state)
 
-      message2 = {:register_servo, 2, :elbow, 1.57, 3, true}
+      message2 = {:register_servo, 2, [:elbow, :servo], 3}
 
       {:reply, {:ok, _}, new_state} =
         Controller.handle_call(message2, {self(), make_ref()}, state)
 
       assert new_state.servo_ids == [1, 2]
 
-      [{1, :shoulder, _, _, _, _, _, _, _, _, _, _, _}] = :ets.lookup(state.servo_table, 1)
-      [{2, :elbow, _, true, _, _, _, _, _, _, _, _, _}] = :ets.lookup(state.servo_table, 2)
+      [{1, [:shoulder, :servo], _, _, _, _, _, _, _, _, _}] =
+        :ets.lookup(state.servo_table, 1)
+
+      [{2, [:elbow, :servo], _, _, _, _, _, _, _, _, _}] = :ets.lookup(state.servo_table, 2)
     end
   end
 
@@ -293,12 +293,12 @@ defmodule BB.Servo.Feetech.ControllerTest do
 
       :ets.insert(
         base.servo_table,
-        {1, :shoulder, 0.0, false, 2, nil, nil, nil, nil, nil, nil, nil, nil}
+        {1, [:shoulder, :servo], 2, nil, nil, nil, nil, nil, nil, nil, nil}
       )
 
       :ets.insert(
         base.servo_table,
-        {2, :elbow, 1.57, false, 2, nil, nil, nil, nil, nil, nil, nil, nil}
+        {2, [:elbow, :servo], 2, nil, nil, nil, nil, nil, nil, nil, nil}
       )
 
       state = %{base.state | servo_ids: [1, 2]}
@@ -339,8 +339,8 @@ defmodule BB.Servo.Feetech.ControllerTest do
     setup :controller_state_with_servos
 
     test "batches pending goal positions into sync_write_raw", %{state: state} do
-      :ets.update_element(state.servo_table, 1, [{12, 2048}, {13, 0}])
-      :ets.update_element(state.servo_table, 2, [{12, 3000}, {13, 1.5}])
+      :ets.update_element(state.servo_table, 1, [{10, 2048}, {11, 0}])
+      :ets.update_element(state.servo_table, 2, [{10, 3000}, {11, 1.5}])
 
       Feetech
       |> expect(:sync_write, fn pid, :goal_speed, values when is_pid(pid) ->
@@ -362,7 +362,7 @@ defmodule BB.Servo.Feetech.ControllerTest do
 
       assert {:noreply, _state} = Controller.handle_info(:tick, state)
 
-      [{1, _, _, _, _, _, _, _, _, _, _, goal_pos, goal_speed}] =
+      [{1, _, _, _, _, _, _, _, _, goal_pos, goal_speed}] =
         :ets.lookup(state.servo_table, 1)
 
       assert goal_pos == nil
@@ -389,6 +389,9 @@ defmodule BB.Servo.Feetech.ControllerTest do
         {:ok, [3.14, 1.57]}
       end)
 
+      BB.Actuator
+      |> stub(:to_joint_space, fn _robot, _path, msg -> msg end)
+
       BB
       |> expect(:publish, 2, fn TestRobot, [:sensor, :feetech, joint_name], msg ->
         assert joint_name in [:shoulder, :elbow]
@@ -405,12 +408,15 @@ defmodule BB.Servo.Feetech.ControllerTest do
         {:ok, [3.14, 1.57]}
       end)
 
+      BB.Actuator
+      |> stub(:to_joint_space, fn _robot, _path, msg -> msg end)
+
       BB
       |> stub(:publish, fn _robot, _path, _msg -> :ok end)
 
       assert {:noreply, _state} = Controller.handle_info(:tick, state)
 
-      [{1, _, _, _, _, last_pos, present_pos, _, _, _, _, _, _}] =
+      [{1, _, _, last_pos, present_pos, _, _, _, _, _, _}] =
         :ets.lookup(state.servo_table, 1)
 
       assert last_pos == 3.14
@@ -418,8 +424,8 @@ defmodule BB.Servo.Feetech.ControllerTest do
     end
 
     test "applies position deadband filtering", %{state: state} do
-      :ets.update_element(state.servo_table, 1, [{6, 3.14}])
-      :ets.update_element(state.servo_table, 2, [{6, 1.57}])
+      :ets.update_element(state.servo_table, 1, [{4, 3.14}])
+      :ets.update_element(state.servo_table, 2, [{4, 1.57}])
 
       Feetech
       |> expect(:sync_read, fn pid, [1, 2], :present_position when is_pid(pid) ->
@@ -516,13 +522,16 @@ defmodule BB.Servo.Feetech.ControllerTest do
 
     :ets.insert(
       base.servo_table,
-      {1, :shoulder, 0.0, false, 2, nil, nil, nil, nil, nil, nil, nil, nil}
+      {1, [:shoulder, :servo], 2, nil, nil, nil, nil, nil, nil, nil, nil}
     )
 
     :ets.insert(
       base.servo_table,
-      {2, :elbow, 1.57, false, 2, nil, nil, nil, nil, nil, nil, nil, nil}
+      {2, [:elbow, :servo], 2, nil, nil, nil, nil, nil, nil, nil, nil}
     )
+
+    BB.Actuator
+    |> stub(:to_joint_space, fn _robot, _path, msg -> msg end)
 
     state = %{base.state | servo_ids: [1, 2]}
 
