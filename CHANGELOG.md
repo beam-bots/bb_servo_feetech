@@ -11,6 +11,19 @@ See [Conventional Commits](Https://conventionalcommits.org) for commit guideline
 
 <!-- changelog -->
 
+## [v0.3.0](https://github.com/beam-bots/bb_servo_pca9685/compare/v0.2.4...v0.3.0) (2026-05-21)
+
+
+
+
+### Features:
+
+* remove `reverse?`, move to motor-space (#28) by James Harton
+
+### Bug Fixes:
+
+* skip `bb_servo_feetech.install` when controller is already present (#27) (#29) by James Harton
+
 ## [v0.2.4](https://github.com/beam-bots/bb_servo_pca9685/compare/v0.2.3...v0.2.4) (2026-05-17)
 
 
