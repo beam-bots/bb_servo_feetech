@@ -33,8 +33,10 @@ if Code.ensure_loaded?(Igniter) do
 
     use Igniter.Mix.Task
 
+    alias Igniter.Code.{Common, Function, Tuple}
     alias Igniter.Project.Formatter
 
+    @controller_module BB.Servo.Feetech.Controller
     @param_group :feetech
     @default_device "/dev/ttyUSB0"
 
@@ -59,19 +61,66 @@ if Code.ensure_loaded?(Igniter) do
       bridge_name = options |> Keyword.get(:bridge_name, "feetech_bridge") |> String.to_atom()
       device = Keyword.get(options, :device, @default_device)
 
-      igniter
-      |> Formatter.import_dep(:bb_servo_feetech)
-      |> BB.Igniter.add_controller(robot_module, name, controller_code(name))
-      |> BB.Igniter.add_parameter_bridge(
-        robot_module,
-        bridge_name,
-        bridge_code(bridge_name, name)
-      )
-      |> BB.Igniter.add_param_group(robot_module, [:config, @param_group], param_group_body())
-      |> BB.Igniter.set_robot_opts(robot_module,
-        params: [config: [{@param_group, [device: device]}]]
-      )
-      |> Igniter.add_notice(topology_snippet(name))
+      case existing_controller_name(igniter, robot_module) do
+        {:ok, existing_name} ->
+          Igniter.add_notice(igniter, already_installed_notice(robot_module, existing_name))
+
+        :error ->
+          igniter
+          |> Formatter.import_dep(:bb_servo_feetech)
+          |> BB.Igniter.add_controller(robot_module, name, controller_code(name))
+          |> BB.Igniter.add_parameter_bridge(
+            robot_module,
+            bridge_name,
+            bridge_code(bridge_name, name)
+          )
+          |> BB.Igniter.add_param_group(robot_module, [:config, @param_group], param_group_body())
+          |> BB.Igniter.set_robot_opts(robot_module,
+            params: [config: [{@param_group, [device: device]}]]
+          )
+          |> Igniter.add_notice(topology_snippet(name))
+      end
+    end
+
+    # The Feetech bus is singleton-per-robot. If a controller targeting
+    # `BB.Servo.Feetech.Controller` is already declared, return its name so the
+    # caller can short-circuit instead of adding a duplicate under a different
+    # entry name (e.g. when both `bb_servo_feetech` and a higher-level
+    # composer like `bb_so101` appear in `mix igniter.new --install`).
+    defp existing_controller_name(igniter, robot_module) do
+      with {:ok, {_igniter, _source, zipper}} <-
+             Igniter.Project.Module.find_module(igniter, robot_module),
+           {:ok, zipper} <- Common.move_to_do_block(zipper),
+           {:ok, zipper} <-
+             Function.move_to_function_call_in_current_scope(zipper, :controllers, 1),
+           {:ok, zipper} <- Common.move_to_do_block(zipper),
+           {:ok, call_zipper} <-
+             Function.move_to_function_call_in_current_scope(
+               zipper,
+               :controller,
+               [2, 3],
+               &controller_targets_module?/1
+             ),
+           {:ok, name_zipper} <- Function.move_to_nth_argument(call_zipper, 0),
+           name when is_atom(name) <- extract_atom(name_zipper) do
+        {:ok, name}
+      else
+        _ -> :error
+      end
+    end
+
+    defp controller_targets_module?(call_zipper) do
+      case Function.move_to_nth_argument(call_zipper, 1) do
+        {:ok, arg_zipper} -> Tuple.elem_equals?(arg_zipper, 0, @controller_module)
+        _ -> false
+      end
+    end
+
+    defp extract_atom(zipper) do
+      case Sourceror.Zipper.node(zipper) do
+        atom when is_atom(atom) -> atom
+        _ -> nil
+      end
     end
 
     defp controller_code(name) do
@@ -95,6 +144,15 @@ if Code.ensure_loaded?(Igniter) do
         type: :integer,
         default: 1_000_000,
         doc: "Communications speed for the serial port"
+      """
+    end
+
+    defp already_installed_notice(robot_module, existing_name) do
+      """
+      bb_servo_feetech: #{inspect(robot_module)} already has a #{inspect(@controller_module)} \
+      registered as `:#{existing_name}`. Skipping install — the Feetech bus is singleton per \
+      robot. If you intended to add servos, attach actuators to joints referencing \
+      `controller: :#{existing_name}` instead.
       """
     end
 
