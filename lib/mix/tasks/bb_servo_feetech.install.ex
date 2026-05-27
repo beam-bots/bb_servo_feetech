@@ -9,8 +9,9 @@ if Code.ensure_loaded?(Igniter) do
     #{@shortdoc}
 
     Adds a `BB.Servo.Feetech.Controller` and `BB.Servo.Feetech.Bridge` to your
-    robot module, defines a `:config.:feetech` param group, and sets the serial
-    device on the robot's child spec in your application module.
+    robot module, defines a `:config.:feetech` param group, writes the serial
+    device default to `config/config.exs`, and wires the robot's child spec to
+    load its opts from the application environment.
 
     Actuators belong on individual joints in your topology and are not added
     automatically — a snippet is printed for you to copy.
@@ -75,8 +76,10 @@ if Code.ensure_loaded?(Igniter) do
             bridge_code(bridge_name, name)
           )
           |> BB.Igniter.add_param_group(robot_module, [:config, @param_group], param_group_body())
-          |> BB.Igniter.set_robot_opts(robot_module,
-            params: [config: [{@param_group, [device: device]}]]
+          |> BB.Igniter.set_robot_param_default(
+            robot_module,
+            [:config, @param_group, :device],
+            device
           )
           |> Igniter.add_notice(topology_snippet(name))
       end
