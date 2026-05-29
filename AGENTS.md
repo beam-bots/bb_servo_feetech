@@ -34,17 +34,17 @@ The project uses `ex_check` - always prefer `mix check --no-retry` over running 
 ### Component Hierarchy
 
 ```
-Controller (GenServer)
+Actuator (GenServer)
+    | writes goal_position/goal_speed
+    v
+Controller's ETS command table
+    ^ drained by the controller's command loop
     |
-    v wraps
-Feetech (Serial communication)
-    ^
-    | used by
-Actuator (GenServer) --publishes--> BeginMotion
-    |
-    v registers with
+Controller (GenServer) --wraps--> Feetech (serial comms) --> Servo registers
+
+Actuator   --publishes--> BeginMotion
 Controller --publishes--> JointState (position feedback)
-          --publishes--> ServoStatus (status monitoring)
+           --publishes--> ServoStatus (status monitoring)
 
 Bridge (GenServer) --reads/writes--> Controller --reads/writes--> Servo registers
 ```
@@ -53,12 +53,13 @@ Bridge (GenServer) --reads/writes--> Controller --reads/writes--> Servo register
 
 - **Controller** (`lib/bb/servo/feetech/controller.ex`) - GenServer wrapping the `Feetech` library.
   Handles serial communication, position feedback polling (via `sync_read`), status monitoring,
-  and torque management. Multiple actuators share one controller. Implements `BB.Controller` and
-  `BB.Safety` behaviours.
+  and torque management. Multiple actuators share one controller. Implements the `BB.Controller`
+  behaviour, including its `disarm/1` safety callback.
 
 - **Actuator** (`lib/bb/servo/feetech/actuator.ex`) - GenServer that receives position commands
-  (radians), converts to servo position (0-4095), sends to controller, and publishes
-  `BB.Message.Actuator.BeginMotion` messages. Handles commands via three delivery methods:
+  (radians), converts to servo position (0-4095), writes `goal_position`/`goal_speed` to the
+  controller's ETS command table, and publishes `BB.Message.Actuator.BeginMotion` messages. Handles
+  commands via three delivery methods:
   - `handle_info/2` for pubsub delivery (`BB.Actuator.set_position/4`)
   - `handle_cast/2` for direct delivery (`BB.Actuator.set_position!/4`)
   - `handle_call/3` for synchronous delivery (`BB.Actuator.set_position_sync/5`)
@@ -80,7 +81,7 @@ The library uses BB's:
 - `BB.Actuator` behaviour for actuator lifecycle
 - `BB.Bridge` behaviour for parameter bridge
 - `BB.Message` for typed message payloads
-- `BB.Safety` for arm/disarm handling
+- `BB.Safety` API to register the controller and report hardware errors
 - `BB.publish`/`BB.subscribe` for hierarchical PubSub by path
 - `BB.Process.call`/`BB.Process.cast` to communicate with sibling processes via the robot registry
 - `Spark.Options` for configuration validation
@@ -151,15 +152,20 @@ BB.Actuator.set_position()
 Actuator receives Command.Position
     |
     v
-Actuator casts to Controller with goal_position
-    |
-    v
-Controller writes to servo via Feetech library
+Actuator writes goal_position/goal_speed to the controller's ETS command table
     |
     v
 Actuator publishes BeginMotion
 
-Controller poll loop (separate):
+Controller command loop (separate):
+    |
+    v
+Controller drains the ETS table and batches pending commands
+    |
+    v
+Controller writes goal_position/goal_speed via Feetech sync_write
+
+Controller position poll loop (separate):
     |
     v
 Controller reads present_position via sync_read
