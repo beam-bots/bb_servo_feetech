@@ -58,8 +58,9 @@ defmodule BB.Servo.Feetech.Controller do
 
   ## Safety
 
-  This controller implements the `BB.Safety` behaviour. When the robot is disarmed
-  or crashes, torque is disabled on all known servo IDs using sync_write for speed.
+  This controller implements the `BB.Controller` behaviour's `disarm/1` safety
+  callback. When the robot is disarmed or crashes, torque is disabled on all known
+  servo IDs using sync_write for speed.
   """
   use BB.Controller,
     options_schema: [
