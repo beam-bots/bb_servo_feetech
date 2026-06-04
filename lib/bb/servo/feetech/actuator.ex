@@ -67,8 +67,6 @@ defmodule BB.Servo.Feetech.Actuator do
   alias BB.Message.Actuator.Command
   alias BB.Process, as: BBProcess
 
-  require Logger
-
   defmodule State do
     @moduledoc false
     defstruct [
