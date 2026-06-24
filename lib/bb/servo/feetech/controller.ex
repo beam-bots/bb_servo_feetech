@@ -60,7 +60,9 @@ defmodule BB.Servo.Feetech.Controller do
 
   This controller implements the `BB.Controller` behaviour's `disarm/1` safety
   callback. When the robot is disarmed or crashes, torque is disabled on all known
-  servo IDs using sync_write for speed.
+  servo IDs using acknowledged per-servo writes, so `disarm/1` only reports `:ok`
+  once the bus has confirmed every servo is safe; any failed or undeliverable
+  write returns `{:error, reason}` and drives the robot into the `:error` state.
   """
   use BB.Controller,
     options_schema: [
@@ -142,16 +144,22 @@ defmodule BB.Servo.Feetech.Controller do
     servo_ids = Keyword.get(opts, :servo_ids, [])
 
     try do
-      if servo_ids != [] do
-        values = Enum.map(servo_ids, fn id -> {id, false} end)
-        Feetech.sync_write(feetech, :torque_enable, values)
-        Feetech.sync_write(feetech, :lock, values)
+      with :ok <- write_all(feetech, servo_ids, :torque_enable, 0) do
+        write_all(feetech, servo_ids, :lock, 0)
       end
-
-      :ok
     catch
-      :exit, _ -> :ok
+      :exit, reason -> {:error, {:exit, reason}}
     end
+  end
+
+  defp write_all(feetech, servo_ids, register, value) do
+    Enum.reduce_while(servo_ids, :ok, fn id, :ok ->
+      case Feetech.write_raw(feetech, id, register, value, await_response: true) do
+        {:ok, _status} -> {:cont, :ok}
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, {:servo, id, register, reason}}}
+      end
+    end)
   end
 
   @impl BB.Controller
