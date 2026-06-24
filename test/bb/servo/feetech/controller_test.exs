@@ -13,19 +13,15 @@ defmodule BB.Servo.Feetech.ControllerTest do
   setup :verify_on_exit!
 
   describe "disarm/1" do
-    test "disables torque on all registered servo IDs" do
+    test "disables torque and lock on all registered servo IDs with acknowledged writes" do
       feetech_pid = self()
 
       Feetech
-      |> expect(:sync_write, fn ^feetech_pid, :torque_enable, values ->
-        assert {1, false} in values
-        assert {2, false} in values
-        :ok
-      end)
-      |> expect(:sync_write, fn ^feetech_pid, :lock, values ->
-        assert {1, false} in values
-        assert {2, false} in values
-        :ok
+      |> expect(:write_raw, 4, fn ^feetech_pid, id, register, 0, opts ->
+        assert id in [1, 2]
+        assert register in [:torque_enable, :lock]
+        assert Keyword.fetch!(opts, :await_response)
+        {:ok, %{}}
       end)
 
       opts = [
@@ -38,6 +34,8 @@ defmodule BB.Servo.Feetech.ControllerTest do
     end
 
     test "returns :ok when no servos registered" do
+      Feetech |> reject(:write_raw, 5)
+
       opts = [
         feetech: self(),
         servo_ids: [],
@@ -48,6 +46,8 @@ defmodule BB.Servo.Feetech.ControllerTest do
     end
 
     test "returns :ok with :hold action without disabling torque" do
+      Feetech |> reject(:write_raw, 5)
+
       opts = [
         feetech: self(),
         servo_ids: [1, 2],
@@ -57,7 +57,24 @@ defmodule BB.Servo.Feetech.ControllerTest do
       assert :ok = Controller.disarm(opts)
     end
 
-    test "returns :ok when feetech process is dead" do
+    test "returns an error when a torque-disable write is rejected" do
+      feetech_pid = self()
+
+      Feetech
+      |> stub(:write_raw, fn ^feetech_pid, id, :torque_enable, 0, _opts ->
+        if id == 2, do: {:error, :timeout}, else: {:ok, %{}}
+      end)
+
+      opts = [
+        feetech: feetech_pid,
+        servo_ids: [1, 2],
+        disarm_action: :disable_torque
+      ]
+
+      assert {:error, {:servo, 2, :torque_enable, :timeout}} = Controller.disarm(opts)
+    end
+
+    test "returns an error when the feetech process is dead" do
       {:ok, dead_pid} = Agent.start(fn -> :ok end)
       Agent.stop(dead_pid)
 
@@ -67,7 +84,7 @@ defmodule BB.Servo.Feetech.ControllerTest do
         disarm_action: :disable_torque
       ]
 
-      assert :ok = Controller.disarm(opts)
+      assert {:error, {:exit, _reason}} = Controller.disarm(opts)
     end
   end
 
