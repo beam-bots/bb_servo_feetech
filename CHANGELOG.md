@@ -11,6 +11,19 @@ See [Conventional Commits](Https://conventionalcommits.org) for commit guideline
 
 <!-- changelog -->
 
+## [v0.3.2](https://github.com/beam-bots/bb_servo_pca9685/compare/v0.3.1...v0.3.2) (2026-06-25)
+
+
+
+
+### Bug Fixes:
+
+* disarm must confirm torque is disabled, not fire-and-forget (#51) (#57) by James Harton
+
+### Improvements:
+
+* support bb 0.20.3 robot_opts/0 child spec (#48) by James Harton
+
 ## [v0.3.1](https://github.com/beam-bots/bb_servo_pca9685/compare/v0.3.0...v0.3.1) (2026-05-27)
 
 
