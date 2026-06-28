@@ -17,11 +17,8 @@ defmodule BB.Servo.Feetech.BridgeTest do
   setup :verify_on_exit!
 
   describe "init/1" do
-    test "queries controller for control table" do
-      BB.Process
-      |> expect(:call, fn TestRobot, :feetech, :get_control_table ->
-        {:ok, @control_table}
-      end)
+    test "does not call the controller (control table is fetched lazily)" do
+      reject(&BB.Process.call/3)
 
       opts = [
         bb: %{robot: TestRobot, path: [:feetech_bridge]},
@@ -31,7 +28,31 @@ defmodule BB.Servo.Feetech.BridgeTest do
       assert {:ok, state} = Bridge.init(opts)
       assert state.robot == TestRobot
       assert state.controller == :feetech
+      assert state.control_table == nil
+    end
+  end
+
+  describe "lazy control table" do
+    test "fetches and memoises the control table on first use" do
+      state = %{robot: TestRobot, controller: :feetech, control_table: nil}
+
+      BB.Process
+      |> expect(:call, fn TestRobot, :feetech, :get_control_table ->
+        {:ok, @control_table}
+      end)
+      |> expect(:call, fn TestRobot, :feetech, :list_servos ->
+        {:ok, [1]}
+      end)
+
+      assert {:ok, _params, state} = Bridge.list_remote(state)
       assert state.control_table == @control_table
+
+      BB.Process
+      |> expect(:call, fn TestRobot, :feetech, :list_servos ->
+        {:ok, [1]}
+      end)
+
+      assert {:ok, _params, _state} = Bridge.list_remote(state)
     end
   end
 
