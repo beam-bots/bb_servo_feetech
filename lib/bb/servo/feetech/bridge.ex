@@ -60,12 +60,10 @@ defmodule BB.Servo.Feetech.Bridge do
     bb = Keyword.fetch!(opts, :bb)
     controller = Keyword.fetch!(opts, :controller)
 
-    {:ok, control_table} = BB.Process.call(bb.robot, controller, :get_control_table)
-
     state = %{
       robot: bb.robot,
       controller: controller,
-      control_table: control_table
+      control_table: nil
     }
 
     {:ok, state}
@@ -98,6 +96,7 @@ defmodule BB.Servo.Feetech.Bridge do
 
   @impl BB.Bridge
   def list_remote(state) do
+    state = ensure_control_table(state)
     {:ok, servo_ids} = BB.Process.call(state.robot, state.controller, :list_servos)
 
     params =
@@ -121,6 +120,8 @@ defmodule BB.Servo.Feetech.Bridge do
 
   @impl BB.Bridge
   def get_remote(param_id, state) do
+    state = ensure_control_table(state)
+
     with {:ok, servo_id, param_name} <- parse_param_id(param_id),
          :ok <- validate_known_param(state.control_table, param_name),
          {:ok, value} <- read_param(state, servo_id, param_name) do
@@ -132,6 +133,8 @@ defmodule BB.Servo.Feetech.Bridge do
 
   @impl BB.Bridge
   def set_remote(param_id, value, state) do
+    state = ensure_control_table(state)
+
     with {:ok, servo_id, param_name} <- parse_param_id(param_id),
          :ok <- validate_known_param(state.control_table, param_name),
          :ok <- validate_writable(state.control_table, param_name),
@@ -146,6 +149,13 @@ defmodule BB.Servo.Feetech.Bridge do
       {:error, reason} -> {:error, reason, state}
     end
   end
+
+  defp ensure_control_table(%{control_table: nil} = state) do
+    {:ok, control_table} = BB.Process.call(state.robot, state.controller, :get_control_table)
+    %{state | control_table: control_table}
+  end
+
+  defp ensure_control_table(state), do: state
 
   defp parse_param_id(param_id) when is_binary(param_id) do
     case String.split(param_id, ":", parts: 2) do
