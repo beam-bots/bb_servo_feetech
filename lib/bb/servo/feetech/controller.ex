@@ -364,17 +364,10 @@ defmodule BB.Servo.Feetech.Controller do
   defp read_positions(%{servo_ids: []} = state), do: state
 
   defp read_positions(state) do
-    case Feetech.sync_read(state.feetech, state.servo_ids, :present_position) do
-      {:ok, positions} ->
-        update_present_positions(state, positions)
-        publish_changed_positions(state.servo_ids, positions, state)
-        state
-
-      {:error, reason} ->
-        Logger.warning("Failed to read positions: #{inspect(reason)}")
-        emit_sync_read_error_diagnostic(state, reason)
-        state
-    end
+    {:ok, positions} = Feetech.sync_read(state.feetech, state.servo_ids, :present_position)
+    update_present_positions(state, positions)
+    publish_changed_positions(state.servo_ids, positions, state)
+    state
   end
 
   defp maybe_poll_status(%{status_every_n_ticks: 0} = state), do: state
@@ -433,14 +426,6 @@ defmodule BB.Servo.Feetech.Controller do
     position_exceeds_deadband?(position_rad, last_rad, deadband)
   end
 
-  defp emit_sync_read_error_diagnostic(state, reason) do
-    component = [state.bb.robot | state.bb.path]
-
-    Diagnostic.error(component, "Communication error reading positions",
-      values: %{reason: inspect(reason)}
-    )
-  end
-
   defp position_exceeds_deadband?(position_rad, last_rad, deadband) do
     deadband_rad = deadband * 2 * :math.pi() / @position_resolution
     abs(position_rad - last_rad) >= deadband_rad
@@ -473,14 +458,9 @@ defmodule BB.Servo.Feetech.Controller do
     torque_off = Enum.map(servo_ids, fn id -> {id, 0} end)
     Feetech.sync_write_raw(state.feetech, :torque_enable, torque_off)
 
-    case Feetech.sync_read(state.feetech, servo_ids, :present_position) do
-      {:ok, positions} ->
-        buffer_goal_positions(state.feetech, servo_ids, positions)
-        Feetech.action(state.feetech)
-
-      {:error, reason} ->
-        Logger.warning("Failed to read positions before arming: #{inspect(reason)}")
-    end
+    {:ok, positions} = Feetech.sync_read(state.feetech, servo_ids, :present_position)
+    buffer_goal_positions(state.feetech, servo_ids, positions)
+    Feetech.action(state.feetech)
 
     torque_on = Enum.map(servo_ids, fn id -> {id, 1} end)
     Feetech.sync_write_raw(state.feetech, :torque_enable, torque_on)
