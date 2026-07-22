@@ -24,12 +24,14 @@ defmodule BB.Servo.Feetech.Controller do
 
   The controller is typically defined in the robot DSL:
 
-      controller :feetech, {BB.Servo.Feetech.Controller,
-        port: "/dev/ttyUSB0",
-        baud_rate: 1_000_000,
-        control_table: Feetech.ControlTable.STS3215,
-        loop_interval_ms: 10
-      }
+      controllers do
+        controller :feetech, {BB.Servo.Feetech.Controller,
+          port: "/dev/ttyUSB0",
+          baud_rate: 1_000_000,
+          control_table: Feetech.ControlTable.STS3215,
+          loop_interval_ms: 10
+        }
+      end
 
   ## Options
 
