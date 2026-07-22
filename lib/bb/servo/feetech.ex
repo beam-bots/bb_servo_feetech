@@ -22,11 +22,13 @@ defmodule BB.Servo.Feetech do
       defmodule MyRobot do
         use BB
 
-        controller :feetech, {BB.Servo.Feetech.Controller,
-          port: "/dev/ttyUSB0",
-          baud_rate: 1_000_000,
-          control_table: Feetech.ControlTable.STS3215
-        }
+        controllers do
+          controller :feetech, {BB.Servo.Feetech.Controller,
+            port: "/dev/ttyUSB0",
+            baud_rate: 1_000_000,
+            control_table: Feetech.ControlTable.STS3215
+          }
+        end
 
         parameters do
           bridge :feetech, {BB.Servo.Feetech.Bridge, controller: :feetech}

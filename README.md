@@ -55,7 +55,7 @@ end
 
 - USB-to-TTL serial adapter compatible with Feetech servos
 - Feetech STS/SCS series servos
-- BB framework (`~> 0.12`)
+- BB framework (`~> 0.21`)
 
 ## Usage
 
@@ -65,11 +65,13 @@ Define a controller and joints with servo actuators in your robot DSL:
 defmodule MyRobot do
   use BB
 
-  controller :feetech, {BB.Servo.Feetech.Controller,
-    port: "/dev/ttyUSB0",
-    baud_rate: 1_000_000,
-    control_table: Feetech.ControlTable.STS3215
-  }
+  controllers do
+    controller :feetech, {BB.Servo.Feetech.Controller,
+      port: "/dev/ttyUSB0",
+      baud_rate: 1_000_000,
+      control_table: Feetech.ControlTable.STS3215
+    }
+  end
 
   topology do
     link :base do
@@ -160,7 +162,7 @@ bus. Define one controller per serial adapter. The controller handles:
 | `port` | string | required | Serial port path (e.g., "/dev/ttyUSB0") |
 | `baud_rate` | integer | 1000000 | Baud rate in bps |
 | `control_table` | module | `Feetech.ControlTable.STS3215` | Servo control table |
-| `poll_interval_ms` | integer | 50 | Position feedback polling interval (20Hz default) |
+| `loop_interval_ms` | integer | 10 | Control loop interval (100 Hz default) |
 | `status_poll_interval_ms` | integer | 1000 | Status polling interval (0 to disable) |
 | `disarm_action` | atom | `:disable_torque` | Action on disarm (`:disable_torque` or `:hold`) |
 
@@ -174,8 +176,18 @@ bus. Define one controller per serial adapter. The controller handles:
 |--------|------|---------|-------------|
 | `servo_id` | 1-253 | required | Feetech servo ID |
 | `controller` | atom | required | Name of the controller in robot registry |
-| `reverse?` | boolean | false | Reverse rotation direction |
 | `position_deadband` | integer | 2 | Minimum position change (raw units) to publish feedback |
+
+Configure direction reversal on the joint transmission, not as an actuator
+option:
+
+```elixir
+actuator :servo, {BB.Servo.Feetech.Actuator, servo_id: 1, controller: :feetech} do
+  transmission do
+    reversed? true
+  end
+end
+```
 
 **Behaviour:**
 
