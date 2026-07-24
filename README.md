@@ -46,7 +46,7 @@ Add `bb_servo_feetech` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:bb_servo_feetech, "~> 0.3.3"}
+    {:bb_servo_feetech, "~> 0.3.4"}
   ]
 end
 ```
