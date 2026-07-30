@@ -62,22 +62,28 @@ defmodule Mix.Tasks.BbServoFeetech.InstallTest do
   end
 
   describe "application config" do
-    test "writes the device default to config/config.exs" do
+    test "writes the runtime device config with an environment override" do
       project_with_robot()
       |> Igniter.compose_task("bb_servo_feetech.install")
-      |> assert_creates("config/config.exs", """
-      import Config
-      config :test, Test.Robot, params: [config: [feetech: [device: "/dev/ttyUSB0"]]]
+      |> assert_has_patch("config/runtime.exs", """
+      + |config :test, Test.Robot,
+      + |  params: [config: [feetech: [device: System.get_env("FEETECH_DEVICE", "/dev/ttyUSB0")]]]
       """)
     end
 
-    test "honours a custom --device option" do
+    test "uses a custom --device option as the runtime fallback" do
       project_with_robot()
       |> Igniter.compose_task("bb_servo_feetech.install", ["--device", "/dev/ttyACM0"])
-      |> assert_creates("config/config.exs", """
-      import Config
-      config :test, Test.Robot, params: [config: [feetech: [device: "/dev/ttyACM0"]]]
+      |> assert_has_patch("config/runtime.exs", """
+      + |config :test, Test.Robot,
+      + |  params: [config: [feetech: [device: System.get_env("FEETECH_DEVICE", "/dev/ttyACM0")]]]
       """)
+    end
+
+    test "does not write the device config to config/config.exs" do
+      project_with_robot()
+      |> Igniter.compose_task("bb_servo_feetech.install")
+      |> assert_unchanged("config/config.exs")
     end
 
     test "leaves the robot's robot_opts/0 child opts untouched" do
