@@ -10,8 +10,9 @@ if Code.ensure_loaded?(Igniter) do
 
     Adds a `BB.Servo.Feetech.Controller` and `BB.Servo.Feetech.Bridge` to your
     robot module, defines a `:config.:feetech` param group, writes the serial
-    device default to `config/config.exs`, and wires the robot's child spec to
-    load its opts from the application environment.
+    device to `config/runtime.exs`, and wires the robot's child spec to load its
+    opts from the application environment. The `FEETECH_DEVICE` environment
+    variable overrides the configured default at runtime.
 
     Actuators belong on individual joints in your topology and are not added
     automatically — a snippet is printed for you to copy.
@@ -29,7 +30,7 @@ if Code.ensure_loaded?(Igniter) do
     * `--robot` - The robot module (defaults to `{AppPrefix}.Robot`).
     * `--name` - The controller name (default `feetech`).
     * `--bridge-name` - The parameter bridge name (default `feetech_bridge`).
-    * `--device` - The serial device path (default `/dev/ttyUSB0`).
+    * `--device` - The fallback serial device path (default `/dev/ttyUSB0`).
     """
 
     use Igniter.Mix.Task
@@ -60,7 +61,10 @@ if Code.ensure_loaded?(Igniter) do
       robot_module = BB.Igniter.robot_module(igniter)
       name = options |> Keyword.get(:name, "feetech") |> String.to_atom()
       bridge_name = options |> Keyword.get(:bridge_name, "feetech_bridge") |> String.to_atom()
-      device = Keyword.get(options, :device, @default_device)
+      device_default = Keyword.get(options, :device, @default_device)
+
+      device =
+        Sourceror.parse_string!(~s|System.get_env("FEETECH_DEVICE", #{inspect(device_default)})|)
 
       case existing_controller_name(igniter, robot_module) do
         {:ok, existing_name} ->
@@ -79,7 +83,8 @@ if Code.ensure_loaded?(Igniter) do
           |> BB.Igniter.set_robot_param_default(
             robot_module,
             [:config, @param_group, :device],
-            device
+            {:code, device},
+            config_file: "runtime.exs"
           )
           |> Igniter.add_notice(topology_snippet(name))
       end

@@ -55,7 +55,7 @@ end
 
 - USB-to-TTL serial adapter compatible with Feetech servos
 - Feetech STS/SCS series servos
-- BB framework (`~> 0.21`)
+- BB framework (`~> 0.22 and >= 0.22.3`)
 
 ## Usage
 
