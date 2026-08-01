@@ -45,9 +45,6 @@ defmodule BB.Servo.Feetech.ActuatorTest do
         end
       end)
 
-      BB
-      |> stub(:subscribe, fn _robot, _path -> :ok end)
-
       on_exit(fn ->
         if :ets.info(servo_table) != :undefined, do: :ets.delete(servo_table)
       end)
@@ -110,20 +107,6 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       assert state.servo_table == servo_table
     end
 
-    test "subscribes to position commands" do
-      BB
-      |> expect(:subscribe, fn TestRobot, [:actuator, :shoulder, :servo] -> :ok end)
-
-      opts = [
-        bb: %{robot: TestRobot, path: [:shoulder, :servo]},
-        servo_id: 1,
-        controller: :feetech,
-        motor_profile: motor_profile()
-      ]
-
-      assert {:ok, _state} = Actuator.init(opts)
-    end
-
     test "fails when motor profile has no lower limit" do
       opts = [
         bb: %{robot: TestRobot, path: [:wheel, :servo]},
@@ -166,7 +149,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       msg = %Message{payload: cmd}
 
       assert {:noreply, _new_state} =
-               Actuator.handle_info({:bb, [:actuator, :shoulder, :servo], msg}, state)
+               Actuator.handle_command(msg, state)
 
       [{1, _, _, _, _, _, _, _, _, goal_position, goal_speed}] = :ets.lookup(servo_table, 1)
       assert goal_position == 2048
@@ -181,7 +164,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       msg = %Message{payload: cmd}
 
       assert {:noreply, _new_state} =
-               Actuator.handle_info({:bb, [:actuator, :shoulder, :servo], msg}, state)
+               Actuator.handle_command(msg, state)
 
       [{1, _, _, _, _, _, _, _, _, goal_position, _}] = :ets.lookup(servo_table, 1)
       # pi/4 radians = 45 degrees = 512 steps from center
@@ -197,7 +180,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       msg = %Message{payload: cmd}
 
       assert {:noreply, _new_state} =
-               Actuator.handle_info({:bb, [:actuator, :shoulder, :servo], msg}, state)
+               Actuator.handle_command(msg, state)
 
       [{1, _, _, _, _, _, _, _, _, goal_position, _}] = :ets.lookup(servo_table, 1)
       # -pi/4 radians = -45 degrees = -512 steps from center
@@ -214,7 +197,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       msg = %Message{payload: cmd}
 
       {:noreply, new_state} =
-        Actuator.handle_info({:bb, [:actuator, :shoulder, :servo], msg}, state)
+        Actuator.handle_command(msg, state)
 
       assert_in_delta new_state.current_motor_angle, @pi / 2, 0.001
 
@@ -229,7 +212,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       msg = %Message{payload: cmd}
 
       {:noreply, new_state} =
-        Actuator.handle_info({:bb, [:actuator, :shoulder, :servo], msg}, state)
+        Actuator.handle_command(msg, state)
 
       assert_in_delta new_state.current_motor_angle, -@pi / 2, 0.001
 
@@ -237,44 +220,6 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       # Position should be clamped to lower limit (-pi/2)
       # -pi/2 = -1024 steps from center = 2048 - 1024 = 1024
       assert_in_delta goal_position, 1024, 1
-    end
-  end
-
-  describe "command handling when not armed" do
-    setup :unarmed_state
-
-    test "ignores pubsub position commands when not armed", %{state: state} do
-      cmd = %Command.Position{position: 0.5}
-      msg = %Message{payload: cmd}
-
-      assert {:noreply, ^state} =
-               Actuator.handle_info({:bb, [:actuator, :shoulder, :servo], msg}, state)
-    end
-
-    test "ignores pubsub trajectory commands when not armed", %{state: state} do
-      cmd = %Command.Trajectory{
-        waypoints: [[position: 0.5, velocity: 1.0, acceleration: 0.0, time_from_start: 0]]
-      }
-
-      msg = %Message{payload: cmd}
-
-      assert {:noreply, ^state} =
-               Actuator.handle_info({:bb, [:actuator, :shoulder, :servo], msg}, state)
-    end
-
-    test "ignores cast commands when not armed", %{state: state} do
-      cmd = %Command.Position{position: 0.5}
-      msg = %Message{payload: cmd}
-
-      assert {:noreply, ^state} = Actuator.handle_cast({:command, msg}, state)
-    end
-
-    test "returns error for sync commands when not armed", %{state: state} do
-      cmd = %Command.Position{position: 0.5}
-      msg = %Message{payload: cmd}
-
-      assert {:reply, {:error, :not_armed}, ^state} =
-               Actuator.handle_call({:command, msg}, {self(), make_ref()}, state)
     end
   end
 
@@ -294,7 +239,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       msg = %Message{payload: cmd}
 
       assert {:noreply, _new_state} =
-               Actuator.handle_info({:bb, [:actuator, :shoulder, :servo], msg}, state)
+               Actuator.handle_command(msg, state)
     end
 
     test "includes command_id when provided", %{state: state} do
@@ -310,7 +255,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       msg = %Message{payload: cmd}
 
       assert {:noreply, _new_state} =
-               Actuator.handle_info({:bb, [:actuator, :shoulder, :servo], msg}, state)
+               Actuator.handle_command(msg, state)
     end
   end
 
@@ -325,7 +270,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       msg = %Message{payload: cmd}
 
       assert {:noreply, _state} =
-               Actuator.handle_info({:bb, [:actuator, :shoulder, :servo], msg}, state)
+               Actuator.handle_command(msg, state)
 
       [{1, _, _, _, _, _, _, _, _, _, goal_speed}] = :ets.lookup(servo_table, 1)
       assert_in_delta goal_speed, 1.0, 0.001
@@ -345,7 +290,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       msg = %Message{payload: cmd}
 
       assert {:noreply, _state} =
-               Actuator.handle_info({:bb, [:actuator, :shoulder, :servo], msg}, state)
+               Actuator.handle_command(msg, state)
     end
 
     test "resets goal_speed to 0 when no hints provided", %{
@@ -356,7 +301,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       msg = %Message{payload: cmd}
 
       assert {:noreply, _state} =
-               Actuator.handle_info({:bb, [:actuator, :shoulder, :servo], msg}, state)
+               Actuator.handle_command(msg, state)
 
       [{1, _, _, _, _, _, _, _, _, _, goal_speed}] = :ets.lookup(servo_table, 1)
       assert goal_speed == 0
@@ -374,7 +319,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       msg = %Message{payload: cmd}
 
       assert {:noreply, _state} =
-               Actuator.handle_info({:bb, [:actuator, :shoulder, :servo], msg}, state)
+               Actuator.handle_command(msg, state)
 
       [{1, _, _, _, _, _, _, _, _, _, goal_speed}] = :ets.lookup(servo_table, 1)
       # Moving 0.5 rad in 500ms → velocity = 0.5 / 0.5 = 1.0 rad/s
@@ -393,7 +338,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       msg = %Message{payload: cmd}
 
       assert {:noreply, _state} =
-               Actuator.handle_info({:bb, [:actuator, :shoulder, :servo], msg}, state)
+               Actuator.handle_command(msg, state)
     end
 
     test "velocity hint takes precedence over duration hint", %{
@@ -404,7 +349,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       msg = %Message{payload: cmd}
 
       assert {:noreply, _state} =
-               Actuator.handle_info({:bb, [:actuator, :shoulder, :servo], msg}, state)
+               Actuator.handle_command(msg, state)
 
       [{1, _, _, _, _, _, _, _, _, _, goal_speed}] = :ets.lookup(servo_table, 1)
       assert_in_delta goal_speed, 2.0, 0.001
@@ -425,7 +370,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       msg = %Message{payload: cmd}
 
       {:noreply, new_state} =
-        Actuator.handle_info({:bb, [:actuator, :shoulder, :servo], msg}, state)
+        Actuator.handle_command(msg, state)
 
       assert new_state.trajectory != nil
       assert new_state.trajectory.index == 0
@@ -454,7 +399,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       msg = %Message{payload: cmd}
 
       assert {:noreply, _state} =
-               Actuator.handle_info({:bb, [:actuator, :shoulder, :servo], msg}, state)
+               Actuator.handle_command(msg, state)
     end
 
     test "clamps waypoint positions to joint limits", %{state: state, servo_table: servo_table} do
@@ -467,7 +412,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       msg = %Message{payload: cmd}
 
       {:noreply, new_state} =
-        Actuator.handle_info({:bb, [:actuator, :shoulder, :servo], msg}, state)
+        Actuator.handle_command(msg, state)
 
       assert_in_delta new_state.current_motor_angle, @pi / 2, 0.001
 
@@ -486,7 +431,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       msg = %Message{payload: cmd}
 
       {:noreply, state_after_start} =
-        Actuator.handle_info({:bb, [:actuator, :shoulder, :servo], msg}, state)
+        Actuator.handle_command(msg, state)
 
       assert state_after_start.trajectory != nil
 
@@ -509,7 +454,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       msg = %Message{payload: cmd}
 
       {:noreply, state} =
-        Actuator.handle_info({:bb, [:actuator, :shoulder, :servo], msg}, state)
+        Actuator.handle_command(msg, state)
 
       assert state.trajectory.index == 0
       assert_in_delta state.current_motor_angle, 0.2, 0.001
@@ -541,7 +486,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       msg = %Message{payload: cmd}
 
       {:noreply, state_with_trajectory} =
-        Actuator.handle_info({:bb, [:actuator, :shoulder, :servo], msg}, state)
+        Actuator.handle_command(msg, state)
 
       assert state_with_trajectory.trajectory != nil
 
@@ -549,10 +494,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       pos_msg = %Message{payload: pos_cmd}
 
       {:noreply, state_after_position} =
-        Actuator.handle_info(
-          {:bb, [:actuator, :shoulder, :servo], pos_msg},
-          state_with_trajectory
-        )
+        Actuator.handle_command(pos_msg, state_with_trajectory)
 
       assert is_nil(state_after_position.trajectory)
       assert is_nil(state_after_position.trajectory_timer)
@@ -567,10 +509,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       }
 
       {:noreply, state_with_first} =
-        Actuator.handle_info(
-          {:bb, [:actuator, :shoulder, :servo], %Message{payload: first_cmd}},
-          state
-        )
+        Actuator.handle_command(%Message{payload: first_cmd}, state)
 
       second_cmd = %Command.Trajectory{
         waypoints: [
@@ -579,10 +518,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       }
 
       {:noreply, state_with_second} =
-        Actuator.handle_info(
-          {:bb, [:actuator, :shoulder, :servo], %Message{payload: second_cmd}},
-          state_with_first
-        )
+        Actuator.handle_command(%Message{payload: second_cmd}, state_with_first)
 
       assert state_with_second.trajectory != nil
       assert_in_delta state_with_second.current_motor_angle, 0.6, 0.001
@@ -603,7 +539,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       msg = %Message{payload: cmd}
 
       {:noreply, state} =
-        Actuator.handle_info({:bb, [:actuator, :shoulder, :servo], msg}, state)
+        Actuator.handle_command(msg, state)
 
       assert state.trajectory.repeat == 2
 
@@ -629,7 +565,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       msg = %Message{payload: cmd}
 
       {:noreply, state} =
-        Actuator.handle_info({:bb, [:actuator, :shoulder, :servo], msg}, state)
+        Actuator.handle_command(msg, state)
 
       assert state.trajectory.repeat == :forever
 
@@ -665,40 +601,8 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       servo_table: servo_table
     }
 
-    BB.Safety
-    |> stub(:armed?, fn _robot -> true end)
-
     BB.Actuator
     |> stub(:publish_begin_motion, fn _robot, _path, _opts -> :ok end)
-
-    on_exit(fn ->
-      if :ets.info(servo_table) != :undefined, do: :ets.delete(servo_table)
-    end)
-
-    %{state: state, servo_table: servo_table}
-  end
-
-  defp unarmed_state(_context) do
-    servo_table = :ets.new(:test_servo_table, [:set, :public])
-
-    :ets.insert(
-      servo_table,
-      {1, [:shoulder, :servo], 2, nil, nil, nil, nil, nil, nil, nil, nil}
-    )
-
-    state = %State{
-      bb: %{robot: TestRobot, path: [:shoulder, :servo]},
-      controller: :feetech,
-      current_motor_angle: 0.0,
-      joint_name: :shoulder,
-      motor_profile: motor_profile(),
-      name: :servo,
-      servo_id: 1,
-      servo_table: servo_table
-    }
-
-    BB.Safety
-    |> stub(:armed?, fn _robot -> false end)
 
     on_exit(fn ->
       if :ets.info(servo_table) != :undefined, do: :ets.delete(servo_table)
