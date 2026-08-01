@@ -55,7 +55,7 @@ end
 
 - USB-to-TTL serial adapter compatible with Feetech servos
 - Feetech STS/SCS series servos
-- BB framework (`~> 0.22 and >= 0.22.3`)
+- BB framework (`~> 0.24`)
 
 ## Usage
 
@@ -75,19 +75,25 @@ defmodule MyRobot do
 
   topology do
     link :base do
-      joint :shoulder, type: :revolute do
-        limit lower: ~u(-90 degree), upper: ~u(90 degree), velocity: ~u(60 degree_per_second)
+      joint :shoulder do
+        type :revolute
 
-        actuator :servo, {BB.Servo.Feetech.Actuator,
+        limit lower: ~u(-90 degree), upper: ~u(90 degree),
+              velocity: ~u(60 degree_per_second), effort: ~u(1 newton_meter)
+
+        actuator :shoulder_servo, {BB.Servo.Feetech.Actuator,
           servo_id: 1,
           controller: :feetech
         }
 
         link :upper_arm do
-          joint :elbow, type: :revolute do
-            limit lower: ~u(-90 degree), upper: ~u(90 degree), velocity: ~u(60 degree_per_second)
+          joint :elbow do
+            type :revolute
 
-            actuator :servo, {BB.Servo.Feetech.Actuator,
+            limit lower: ~u(-90 degree), upper: ~u(90 degree),
+                  velocity: ~u(60 degree_per_second), effort: ~u(1 newton_meter)
+
+            actuator :elbow_servo, {BB.Servo.Feetech.Actuator,
               servo_id: 2,
               controller: :feetech
             }
@@ -108,8 +114,20 @@ handled by the controller; no separate sensor is needed.
 
 ## Sending Commands
 
-Use the `BB.Actuator` module to send commands to servos. Three delivery methods
-are available:
+Use the `BB.Actuator` module to send commands to servos. Arm the robot first —
+commands to a disarmed robot are refused before they reach the driver:
+
+```elixir
+{:ok, cmd} = MyRobot.arm()
+{:ok, :armed, _} = BB.Command.await(cmd)
+```
+
+There are three ways to deliver a command. They differ in transport, not in
+what the driver sees: all three arrive at the actuator's `handle_command/2`,
+and none can skip the framework's arm check or its joint-to-motor transmission.
+
+Every function takes either the actuator's unique name or its full path
+through the topology.
 
 ### Pubsub Delivery (for orchestration)
 
@@ -117,9 +135,14 @@ Commands are published via pubsub, enabling logging, replay, and multi-subscribe
 patterns:
 
 ```elixir
-BB.Actuator.set_position(MyRobot, [:base, :shoulder, :servo], 0.5)
+# By name
+BB.Actuator.set_position(MyRobot, :shoulder_servo, 0.5)
 
-BB.Actuator.set_position(MyRobot, [:base, :shoulder, :servo], 0.5,
+# Or by full path
+BB.Actuator.set_position(MyRobot, [:base, :shoulder, :shoulder_servo], 0.5)
+
+# With options
+BB.Actuator.set_position(MyRobot, :shoulder_servo, 0.5,
   command_id: make_ref()
 )
 ```
@@ -129,7 +152,7 @@ BB.Actuator.set_position(MyRobot, [:base, :shoulder, :servo], 0.5,
 Commands bypass pubsub for lower latency:
 
 ```elixir
-BB.Actuator.set_position!(MyRobot, :servo, 0.5)
+BB.Actuator.set_position!(MyRobot, :shoulder_servo, 0.5)
 ```
 
 ### Synchronous Delivery (with acknowledgement)
@@ -137,7 +160,7 @@ BB.Actuator.set_position!(MyRobot, :servo, 0.5)
 Wait for the actuator to acknowledge the command:
 
 ```elixir
-case BB.Actuator.set_position_sync(MyRobot, :servo, 0.5) do
+case BB.Actuator.set_position_sync(MyRobot, :shoulder_servo, 0.5) do
   {:ok, :accepted} -> :ok
   {:error, reason} -> handle_error(reason)
 end
