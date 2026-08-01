@@ -109,8 +109,6 @@ defmodule BB.Servo.Feetech.Actuator do
     with {:ok, state} <- build_state(opts),
          :ok <- disable_torque(state),
          {:ok, servo_table} <- register_servo(state) do
-      BB.subscribe(state.bb.robot, [:actuator, state.joint_name, state.name])
-
       {:ok, %{state | servo_table: servo_table}}
     else
       {:error, reason} -> {:stop, reason}
@@ -205,59 +203,19 @@ defmodule BB.Servo.Feetech.Actuator do
   # --- Command handling ---
 
   @impl BB.Actuator
-  def handle_info({:bb, _path, %Message{payload: %Command.Position{} = cmd}}, state) do
-    if BB.Safety.armed?(state.bb.robot) do
-      {:noreply, _state} = do_set_position(cmd, state)
-    else
-      {:noreply, state}
-    end
+  def handle_command(%Message{payload: %Command.Position{} = cmd}, state) do
+    do_set_position(cmd, state)
   end
 
-  def handle_info({:bb, _path, %Message{payload: %Command.Trajectory{} = cmd}}, state) do
-    if BB.Safety.armed?(state.bb.robot) do
-      {:noreply, start_trajectory(cmd, state)}
-    else
-      {:noreply, state}
-    end
+  def handle_command(%Message{payload: %Command.Trajectory{} = cmd}, state) do
+    {:noreply, start_trajectory(cmd, state)}
   end
 
+  def handle_command(%Message{}, state), do: {:noreply, state}
+
+  @impl BB.Actuator
   def handle_info(:trajectory_next, state) do
     {:noreply, advance_trajectory(state)}
-  end
-
-  @impl BB.Actuator
-  def handle_cast({:command, %Message{payload: %Command.Position{} = cmd}}, state) do
-    if BB.Safety.armed?(state.bb.robot) do
-      do_set_position(cmd, state)
-    else
-      {:noreply, state}
-    end
-  end
-
-  def handle_cast({:command, %Message{payload: %Command.Trajectory{} = cmd}}, state) do
-    if BB.Safety.armed?(state.bb.robot) do
-      {:noreply, start_trajectory(cmd, state)}
-    else
-      {:noreply, state}
-    end
-  end
-
-  @impl BB.Actuator
-  def handle_call({:command, %Message{payload: %Command.Position{} = cmd}}, _from, state) do
-    if BB.Safety.armed?(state.bb.robot) do
-      {:noreply, new_state} = do_set_position(cmd, state)
-      {:reply, {:ok, :accepted}, new_state}
-    else
-      {:reply, {:error, :not_armed}, state}
-    end
-  end
-
-  def handle_call({:command, %Message{payload: %Command.Trajectory{} = cmd}}, _from, state) do
-    if BB.Safety.armed?(state.bb.robot) do
-      {:reply, {:ok, :accepted}, start_trajectory(cmd, state)}
-    else
-      {:reply, {:error, :not_armed}, state}
-    end
   end
 
   # --- Position commands ---
