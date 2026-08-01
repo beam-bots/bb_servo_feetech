@@ -94,8 +94,13 @@ The library uses BB's:
 Send commands using the `BB.Actuator` module:
 
 ```elixir
-# Pubsub delivery (for orchestration/logging)
-BB.Actuator.set_position(MyRobot, [:joint, :servo], 0.5)
+# Arm first — a disarmed robot refuses commands before they reach the driver
+{:ok, cmd} = MyRobot.arm()
+{:ok, :armed, _} = BB.Command.await(cmd)
+
+# Pubsub delivery (for orchestration/logging). Takes a name or a full path.
+BB.Actuator.set_position(MyRobot, :servo, 0.5)
+BB.Actuator.set_position(MyRobot, [:base, :shoulder, :servo], 0.5)
 
 # Direct delivery (fire-and-forget, lower latency)
 BB.Actuator.set_position!(MyRobot, :servo, 0.5)
@@ -119,18 +124,26 @@ defmodule MyRobot do
   end
 
   parameters do
-    bridge :feetech, {BB.Servo.Feetech.Bridge, controller: :feetech}
+    # Names are unique across the whole robot, so the bridge can't also be
+    # called `:feetech` — that's already the controller.
+    bridge :feetech_params, {BB.Servo.Feetech.Bridge, controller: :feetech}
   end
 
   topology do
     link :base do
-      joint :shoulder, type: :revolute do
-        limit lower: ~u(-90 degree), upper: ~u(90 degree), velocity: ~u(60 degree_per_second)
+      joint :shoulder do
+        type :revolute
+
+        limit lower: ~u(-90 degree), upper: ~u(90 degree),
+              velocity: ~u(60 degree_per_second), effort: ~u(1 newton_meter)
 
         actuator :servo, {BB.Servo.Feetech.Actuator,
           servo_id: 1,
           controller: :feetech
         }
+
+        link :upper_arm do
+        end
       end
     end
   end
