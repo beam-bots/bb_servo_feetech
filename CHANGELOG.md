@@ -11,6 +11,13 @@ See [Conventional Commits](Https://conventionalcommits.org) for commit guideline
 
 <!-- changelog -->
 
+## [v0.5.0](https://github.com/beam-bots/bb_servo_pca9685/compare/v0.4.0...v0.5.0) (2026-08-02)
+### Breaking Changes:
+
+* declare the command payloads this driver implements by James Harton
+
+
+
 ## [v0.4.0](https://github.com/beam-bots/bb_servo_pca9685/compare/v0.3.5...v0.4.0) (2026-08-01)
 ### Breaking Changes:
 
