@@ -19,13 +19,11 @@ defmodule Mix.Tasks.BbServoFeetech.InstallTest do
       project_with_robot()
       |> Igniter.compose_task("bb_servo_feetech.install")
       |> assert_has_patch("lib/test/robot.ex", """
-      + |    controller(
-      + |      :feetech,
-      + |      {BB.Servo.Feetech.Controller,
-      + |       port: param([:config, :feetech, :device]),
-      + |       baud_rate: param([:config, :feetech, :baud_rate]),
-      + |       control_table: Feetech.ControlTable.STS3215}
-      + |    )
+      + |    controller :feetech,
+      + |               {BB.Servo.Feetech.Controller,
+      + |                port: param([:config, :feetech, :device]),
+      + |                baud_rate: param([:config, :feetech, :baud_rate]),
+      + |                control_table: Feetech.ControlTable.STS3215}
       """)
     end
 
@@ -33,8 +31,7 @@ defmodule Mix.Tasks.BbServoFeetech.InstallTest do
       project_with_robot()
       |> Igniter.compose_task("bb_servo_feetech.install", ["--name", "sts"])
       |> assert_has_patch("lib/test/robot.ex", """
-      + |    controller(
-      + |      :sts,
+      + |    controller :sts,
       """)
     end
   end
@@ -44,7 +41,7 @@ defmodule Mix.Tasks.BbServoFeetech.InstallTest do
       project_with_robot()
       |> Igniter.compose_task("bb_servo_feetech.install")
       |> assert_has_patch("lib/test/robot.ex", """
-      + |    bridge(:feetech_bridge, {BB.Servo.Feetech.Bridge, controller: :feetech})
+      + |    bridge :feetech_bridge, {BB.Servo.Feetech.Bridge, controller: :feetech}
       """)
     end
   end
@@ -56,7 +53,7 @@ defmodule Mix.Tasks.BbServoFeetech.InstallTest do
       |> assert_has_patch("lib/test/robot.ex", """
       + |    group :config do
       + |      group :feetech do
-      + |        param(:device, type: :string, doc: "Serial device connected to the Feetech servo bus")
+      + |        param :device, type: :string, doc: "Serial device connected to the Feetech servo bus"
       """)
     end
   end
