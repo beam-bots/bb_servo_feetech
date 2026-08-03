@@ -11,6 +11,19 @@ See [Conventional Commits](Https://conventionalcommits.org) for commit guideline
 
 <!-- changelog -->
 
+## [v0.5.1](https://github.com/beam-bots/bb_servo_pca9685/compare/v0.5.0...v0.5.1) (2026-08-03)
+
+
+
+
+### Bug Fixes:
+
+* test: expect paren-less DSL from the installer (#88) by James Harton
+
+### Improvements:
+
+* drive the servo bus loop from `BB.Loop` (#90) by James Harton
+
 ## [v0.5.0](https://github.com/beam-bots/bb_servo_pca9685/compare/v0.4.0...v0.5.0) (2026-08-02)
 ### Breaking Changes:
 
