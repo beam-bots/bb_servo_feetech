@@ -188,7 +188,7 @@ defmodule BB.Servo.Feetech.Controller do
           feetech: feetech,
           control_table: control_table,
           name: List.last(bb.path),
-          loop_interval_ms: loop_interval_ms,
+          loop: BB.Loop.new(bb, clock: {:rate, 1000 / loop_interval_ms}),
           status_poll_interval_ms: status_poll_interval_ms,
           status_every_n_ticks: status_every_n_ticks,
           status_tick_counter: 0,
@@ -302,21 +302,18 @@ defmodule BB.Servo.Feetech.Controller do
 
   @impl BB.Controller
   def handle_info(:start_loop, state) do
-    schedule_tick(state.loop_interval_ms)
-    {:noreply, state}
+    {:noreply, %{state | loop: BB.Loop.arm(state.loop)}}
   end
 
   def handle_info(:tick, state) do
-    tick_start = System.monotonic_time(:millisecond)
+    {_dt, _skipped, loop} = BB.Loop.tick(state.loop)
 
     state =
-      state
+      %{state | loop: loop}
       |> process_commands()
       |> read_positions()
       |> maybe_poll_status()
 
-    elapsed = System.monotonic_time(:millisecond) - tick_start
-    schedule_tick(max(0, state.loop_interval_ms - elapsed))
     {:noreply, state}
   end
 
@@ -330,10 +327,6 @@ defmodule BB.Servo.Feetech.Controller do
   end
 
   # --- Control loop ---
-
-  defp schedule_tick(interval_ms) do
-    Process.send_after(self(), :tick, interval_ms)
-  end
 
   defp process_commands(%{servo_ids: []} = state), do: state
 
@@ -754,6 +747,8 @@ defmodule BB.Servo.Feetech.Controller do
 
   @impl BB.Controller
   def terminate(_reason, state) do
+    BB.Loop.cancel(state.loop)
+
     if Process.alive?(state.feetech) do
       Feetech.stop(state.feetech)
     end

@@ -151,7 +151,8 @@ defmodule BB.Servo.Feetech.ControllerTest do
       ]
 
       assert {:ok, state} = Controller.init(opts)
-      assert state.loop_interval_ms == 10
+      assert state.loop.clock == {:rate, 100.0}
+      assert state.loop.period_ns == 10_000_000
 
       :ets.delete(state.servo_table)
     end
@@ -508,12 +509,14 @@ defmodule BB.Servo.Feetech.ControllerTest do
     feetech_pid = spawn(fn -> Process.sleep(:infinity) end)
     servo_table = :ets.new(:test_servo_table, [:set, :public])
 
+    bb = %{robot: TestRobot, path: [:feetech]}
+
     state = %{
-      bb: %{robot: TestRobot, path: [:feetech]},
+      bb: bb,
       feetech: feetech_pid,
       control_table: @control_table,
       name: :feetech,
-      loop_interval_ms: 10,
+      loop: BB.Loop.new(bb, clock: {:rate, 100}),
       status_poll_interval_ms: 1000,
       status_every_n_ticks: 100,
       status_tick_counter: 0,
