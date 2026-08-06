@@ -159,6 +159,11 @@ chasing, so callers needn't pair the two.
 - **Don't declare a controller per servo, or give actuators a `port`.** One
   controller per bus; each actuator on it sets `controller:` to that entry's
   name and `servo_id:` to its address.
+- **Don't give two actuators the same `servo_id`.** The controller keys its
+  shared table on the ID, so the second actuator would take over the first's
+  row — the second one refuses to start instead. Two *servos* sharing an ID is
+  a separate problem the bus reports for itself; `mix feetech.scan` shows what
+  is actually on there.
 - **Don't pass `reversed?`/`offset` as actuator options.** Direction and
   zero-offset live in the joint's `transmission do … end` block.
 - **Don't expect `set_effort/4` to move anything.** These servos have no torque

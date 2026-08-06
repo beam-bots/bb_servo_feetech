@@ -253,35 +253,14 @@ defmodule BB.Servo.Feetech.Controller do
         _from,
         state
       ) do
-    :ets.insert(state.servo_table, {
-      servo_id,
-      actuator_path,
-      position_deadband,
-      _last_position_raw = nil,
-      _present_position = nil,
-      _present_temperature = nil,
-      _present_voltage = nil,
-      _present_load = nil,
-      _hardware_error = nil,
-      _pending_writes = nil,
-      _pending_limit = nil,
-      # The actuator disables torque before it registers.
-      _torque_enabled = false
-    })
+    case registered_path(state, servo_id) do
+      taken when taken not in [nil, actuator_path] ->
+        {:reply, {:error, duplicate_servo_id(servo_id, actuator_path, taken)}, state}
 
-    servo_ids = [servo_id | state.servo_ids] |> Enum.sort() |> Enum.uniq()
-
-    BB.Safety.register(__MODULE__,
-      robot: state.bb.robot,
-      path: state.bb.path,
-      opts: [
-        feetech: state.feetech,
-        servo_ids: servo_ids,
-        disarm_action: state.disarm_action
-      ]
-    )
-
-    {:reply, {:ok, state.servo_table}, %{state | servo_ids: servo_ids}}
+      _free_or_ours ->
+        insert_servo_row(state, servo_id, actuator_path, position_deadband)
+        {:reply, {:ok, state.servo_table}, track_servo_id(state, servo_id)}
+    end
   end
 
   def handle_call({:read, servo_id, param}, _from, state) do
@@ -344,6 +323,65 @@ defmodule BB.Servo.Feetech.Controller do
   # that is.
   def handle_call({:resume_servo, servo_id, pending_writes}, _from, state) do
     {:reply, resume_servo(state, servo_id, pending_writes), state}
+  end
+
+  # --- Servo registration ---
+
+  # The table is keyed on the servo ID, so a second actuator claiming one would
+  # take over the first's row: only the later joint would get position feedback,
+  # and the two would overwrite each other's pending writes every tick. An
+  # actuator that has restarted re-registers under its own path, and gets a
+  # fresh row.
+  #
+  # Two *servos* sharing an ID is a different problem, and one the bus reports
+  # for itself — they both answer the same read and the frames collide.
+  defp registered_path(state, servo_id) do
+    case :ets.lookup(state.servo_table, servo_id) do
+      [{^servo_id, actuator_path, _, _, _, _, _, _, _, _, _, _}] -> actuator_path
+      [] -> nil
+    end
+  end
+
+  defp duplicate_servo_id(servo_id, actuator_path, registered_path) do
+    %BB.Error.Invalid.Feetech.DuplicateServoId{
+      servo_id: servo_id,
+      actuator_path: actuator_path,
+      registered_path: registered_path
+    }
+  end
+
+  defp track_servo_id(state, servo_id) do
+    servo_ids = [servo_id | state.servo_ids] |> Enum.sort() |> Enum.uniq()
+
+    BB.Safety.register(__MODULE__,
+      robot: state.bb.robot,
+      path: state.bb.path,
+      opts: [
+        feetech: state.feetech,
+        servo_ids: servo_ids,
+        disarm_action: state.disarm_action
+      ]
+    )
+
+    %{state | servo_ids: servo_ids}
+  end
+
+  defp insert_servo_row(state, servo_id, actuator_path, position_deadband) do
+    :ets.insert(state.servo_table, {
+      servo_id,
+      actuator_path,
+      position_deadband,
+      _last_position_raw = nil,
+      _present_position = nil,
+      _present_temperature = nil,
+      _present_voltage = nil,
+      _present_load = nil,
+      _hardware_error = nil,
+      _pending_writes = nil,
+      _pending_limit = nil,
+      # The actuator disables torque before it registers.
+      _torque_enabled = false
+    })
   end
 
   # --- Handle info ---

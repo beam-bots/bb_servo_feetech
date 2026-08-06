@@ -240,6 +240,42 @@ defmodule BB.Servo.Feetech.ControllerTest do
       assert torque_enabled == false
     end
 
+    test "refuses a servo ID another actuator already drives", %{state: state} do
+      first = {:register_servo, 1, [:shoulder, :servo], 2}
+      {:reply, {:ok, _}, state} = Controller.handle_call(first, {self(), make_ref()}, state)
+
+      second = {:register_servo, 1, [:elbow, :servo], 2}
+
+      assert {:reply, {:error, error}, new_state} =
+               Controller.handle_call(second, {self(), make_ref()}, state)
+
+      assert %BB.Error.Invalid.Feetech.DuplicateServoId{
+               servo_id: 1,
+               actuator_path: [:elbow, :servo],
+               registered_path: [:shoulder, :servo]
+             } = error
+
+      # The first actuator keeps its row and its feedback.
+      assert [{1, [:shoulder, :servo], _, _, _, _, _, _, _, _, _, _}] =
+               :ets.lookup(state.servo_table, 1)
+
+      assert new_state.servo_ids == [1]
+    end
+
+    test "lets an actuator that restarted re-register its own servo", %{state: state} do
+      message = {:register_servo, 1, [:shoulder, :servo], 2}
+      {:reply, {:ok, _}, state} = Controller.handle_call(message, {self(), make_ref()}, state)
+
+      # Whatever the previous incarnation left behind is stale.
+      :ets.update_element(state.servo_table, 1, [{10, [goal_position: 3000]}, {12, true}])
+
+      assert {:reply, {:ok, _table}, _state} =
+               Controller.handle_call(message, {self(), make_ref()}, state)
+
+      assert [{1, [:shoulder, :servo], _, _, _, _, _, _, _, nil, nil, false}] =
+               :ets.lookup(state.servo_table, 1)
+    end
+
     test "registers multiple servos", %{state: state} do
       message1 = {:register_servo, 1, [:shoulder, :servo], 2}
       {:reply, {:ok, _}, state} = Controller.handle_call(message1, {self(), make_ref()}, state)

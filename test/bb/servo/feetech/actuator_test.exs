@@ -226,6 +226,27 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       assert error.message =~ "beyond the"
     end
 
+    test "refuses to start when the controller says the servo ID is taken" do
+      taken = %BB.Error.Invalid.Feetech.DuplicateServoId{
+        servo_id: 1,
+        actuator_path: [:shoulder, :servo],
+        registered_path: [:elbow, :servo]
+      }
+
+      BB.Process
+      |> stub(:call, fn _robot, _controller, msg ->
+        case msg do
+          {:write, _id, :torque_enable, false} -> :ok
+          {:read, _id, :model_number} -> {:ok, 777}
+          {:read, _id, :mode} -> {:ok, :position}
+          {:write, _id, :acceleration, _} -> :ok
+          {:register_servo, _, _, _} -> {:error, taken}
+        end
+      end)
+
+      assert {:stop, ^taken} = Actuator.init(base_opts())
+    end
+
     test "refuses a joint faster than the speed register can express" do
       # The SO-101 declares 360 degree_per_second, which is exactly 4096
       # steps/s — one past the end of a 0..4095 register.
