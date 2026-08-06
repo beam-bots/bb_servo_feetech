@@ -131,7 +131,7 @@ defmodule BB.Servo.Feetech.Actuator do
         default: :position
       ],
       stall_torque: [
-        type: {:or, [nil, unit_type(compatible: :newton_meter)]},
+        type: unit_type(compatible: :newton_meter),
         doc: """
         The servo's rated stall torque, used to scale `Command.Effort` into a
         `torque_limit` ceiling. Defaults to the figure in
@@ -139,7 +139,7 @@ defmodule BB.Servo.Feetech.Actuator do
         yourself if the servo isn't recognised, or if it is an STS3215 variant
         other than the 7.4V 1:345 — they all report the same model number.
         """,
-        default: nil
+        required: false
       ],
       expiry_action: [
         type: {:in, [:hold, :stop]},
