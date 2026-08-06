@@ -87,6 +87,11 @@ Bridge (GenServer) --reads/writes--> Controller --reads/writes--> Servo register
   written once with torque already off and the `lock` register cleared, and only when the servo
   isn't already in the right mode. The servo's `:pwm` and `:step` modes aren't offered.
 
+  The joint's `motor_acceleration_limit` is written to the servo's `acceleration`
+  register once at startup, and again if a parameter change alters the profile. A joint
+  declaring no acceleration limit gets `0`, the servo's "no limit" — which is what
+  `BB.Sim.Actuator` assumes when it falls back to a rectangular velocity profile.
+
   `Command.Effort` is a **ceiling, not a goal** — these servos have no torque goal register.
   It writes `torque_limit` as a fraction of the model's rated stall torque (see **Model**), so
   setting one won't move anything on its own.

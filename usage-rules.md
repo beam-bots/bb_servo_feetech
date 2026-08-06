@@ -30,7 +30,12 @@ Feetech.
 3. **Command joint-space; the transmission handles motor-space.** Set positions
    in radians via `BB.Actuator`; BB applies the joint's `transmission`
    (`reversed?`, `offset`, gearing) before the value reaches the driver.
-4. **Torque is centralised in the controller.** On arm it enables torque on all
+4. **The joint's acceleration limit is written to the servo.** `acceleration`
+   is set once at startup from `motor_acceleration_limit`. A joint that
+   declares none gets `0`, which the servo reads as "no limit" — matching the
+   rectangular velocity profile `BB.Sim.Actuator` falls back to, so simulation
+   and hardware agree about arrival times either way.
+5. **Torque is centralised in the controller.** On arm it enables torque on all
    registered servos; on disarm or crash it disables (or holds) torque for every
    servo ID in one pass. The actuator's `disarm/1` is a deliberate no-op.
 
@@ -110,8 +115,8 @@ options — the actuator derives its motor profile from the topology.
 
 The actuator refuses to start if those limits are outside what the servo's
 registers can express: the encoder spans one revolution centred on motor zero
-(-180.0° to 179.9°), and `goal_speed` tops out at 359.9°/s. Both are checked in
-motor space, after the transmission. Clamping quietly instead would put the
+(-180.0° to 179.9°), `goal_speed` tops out at 359.9°/s, and `acceleration` at
+2232.9°/s². All are checked in motor space, after the transmission. Clamping quietly instead would put the
 joint's declared limits — which is what `BeginMotion` computes arrival times
 from — out of step with what the servo actually does.
 

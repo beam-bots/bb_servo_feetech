@@ -196,6 +196,11 @@ defmodule BB.Servo.Feetech.Actuator do
   @max_motor_angle (@position_resolution - 1 - @position_center) * @radians_per_step
   @max_motor_speed (@position_resolution - 1) * @radians_per_step
 
+  # `acceleration` is a single byte counting hundreds of steps per second
+  # squared, so it is coarse as well as bounded.
+  @radians_per_acceleration_unit 100 * @radians_per_step
+  @max_motor_acceleration 254 * @radians_per_acceleration_unit
+
   # ETS tuple field indices for command writes
   @ets_idx_pending_writes 10
   @ets_idx_pending_limit 11
@@ -217,6 +222,7 @@ defmodule BB.Servo.Feetech.Actuator do
          :ok <- disable_torque(state),
          {:ok, state} <- resolve_stall_torque(state),
          :ok <- configure_mode(state),
+         :ok <- write_acceleration(state),
          {:ok, servo_table} <- register_servo(state) do
       {:ok, %{state | servo_table: servo_table}}
     else
@@ -228,12 +234,18 @@ defmodule BB.Servo.Feetech.Actuator do
   def handle_options(new_opts, state) do
     motor_profile = Keyword.fetch!(new_opts, :motor_profile)
 
-    {:ok,
-     %{
-       state
-       | motor_profile: motor_profile,
-         current_motor_angle: clamp_motor_angle(state.current_motor_angle, motor_profile)
-     }}
+    state = %{
+      state
+      | motor_profile: motor_profile,
+        current_motor_angle: clamp_motor_angle(state.current_motor_angle, motor_profile)
+    }
+
+    with :ok <- validate_motor_profile(motor_profile, state.joint_name),
+         :ok <- write_acceleration(state) do
+      {:ok, state}
+    else
+      {:error, reason} -> {:stop, reason}
+    end
   end
 
   defp build_state(opts) do
@@ -335,6 +347,24 @@ defmodule BB.Servo.Feetech.Actuator do
      }}
   end
 
+  # Acceleration is optional — `nil` means the joint declares no limit, which
+  # the register expresses as 0. A guard on `is_number/1` rather than an earlier
+  # `nil` clause, because in Erlang term order an atom sorts above every number
+  # and `nil > @max_motor_acceleration` would otherwise be true.
+  defp validate_motor_profile(%{motor_acceleration_limit: acceleration}, joint_name)
+       when is_number(acceleration) and acceleration > @max_motor_acceleration do
+    {:error,
+     %JointConfigError{
+       joint: joint_name,
+       field: :acceleration,
+       value: acceleration,
+       message:
+         "Joint is declared at #{degrees(acceleration)}/s² in motor space, " <>
+           "beyond the #{degrees(@max_motor_acceleration)}/s² the servo's " <>
+           "acceleration register can express"
+     }}
+  end
+
   defp validate_motor_profile(_profile, _joint_name), do: :ok
 
   defp degrees(radians) do
@@ -397,6 +427,30 @@ defmodule BB.Servo.Feetech.Actuator do
       {:ok, _} -> :ok
       {:error, _} = error -> error
     end
+  end
+
+  # `acceleration` bounds how fast the servo changes speed, in both modes. It
+  # lives in SRAM and sticks, so it goes on once at startup rather than riding
+  # along with every goal.
+  #
+  # A joint that declares no acceleration limit gets 0, which the servo reads as
+  # "no limit" — matching what `BB.Sim.Actuator` assumes when it falls back to a
+  # rectangular velocity profile, so simulation and hardware agree about arrival
+  # times either way. Writing it unconditionally also clears whatever a previous
+  # configuration left in the register.
+  #
+  # Clamped up to one raw unit, because a limit that rounds to 0 would mean the
+  # opposite of what was asked for. One unit is slower than requested, which is
+  # the safe direction to be wrong in.
+  defp write_acceleration(state), do: write_param(state, :acceleration, acceleration_raw(state))
+
+  defp acceleration_raw(%{motor_profile: %{motor_acceleration_limit: nil}}), do: 0
+
+  defp acceleration_raw(%{motor_profile: %{motor_acceleration_limit: limit}}) do
+    limit
+    |> Kernel./(@radians_per_acceleration_unit)
+    |> round()
+    |> max(1)
   end
 
   defp register_servo(state) do

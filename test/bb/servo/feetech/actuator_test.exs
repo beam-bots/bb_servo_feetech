@@ -45,6 +45,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
           {:write, _id, :torque_enable, false} -> :ok
           {:read, _id, :model_number} -> {:ok, 777}
           {:read, _id, :mode} -> {:ok, :position}
+          {:write, _id, :acceleration, _} -> :ok
           {:register_servo, _, _, _} -> {:ok, servo_table}
         end
       end)
@@ -85,6 +86,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
         case msg do
           {:read, _id, :model_number} -> {:ok, 777}
           {:read, _id, :mode} -> {:ok, :position}
+          {:write, _id, :acceleration, _} -> :ok
           {:register_servo, _, _, _} -> {:ok, servo_table}
         end
       end)
@@ -104,6 +106,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       |> expect(:call, fn TestRobot, :feetech, {:write, 1, :torque_enable, false} -> :ok end)
       |> expect(:call, fn TestRobot, :feetech, {:read, 1, :model_number} -> {:ok, 777} end)
       |> expect(:call, fn TestRobot, :feetech, {:read, 1, :mode} -> {:ok, :position} end)
+      |> expect(:call, fn TestRobot, :feetech, {:write, 1, :acceleration, 0} -> :ok end)
       |> expect(:call, fn TestRobot, :feetech, {:register_servo, 1, [:shoulder, :servo], 2} ->
         {:ok, servo_table}
       end)
@@ -150,6 +153,77 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       ]
 
       assert {:stop, %BB.Error.Invalid.JointConfig{field: :velocity}} = Actuator.init(opts)
+    end
+
+    test "writes the joint's acceleration limit to the servo" do
+      test_pid = self()
+
+      BB.Process
+      |> stub(:call, fn _robot, _controller, msg ->
+        case msg do
+          {:write, _id, :torque_enable, false} -> :ok
+          {:read, _id, :model_number} -> {:ok, 777}
+          {:read, _id, :mode} -> {:ok, :position}
+          {:register_servo, _, _, _} -> {:ok, :table}
+          {:write, _id, :acceleration, raw} -> send(test_pid, {:acceleration, raw}) && :ok
+        end
+      end)
+
+      # The SO-101 declares 2160 degree_per_square_second, which is 37.7 rad/s²
+      # against a register counting hundreds of steps per second squared.
+      opts =
+        base_opts(motor_profile: motor_profile(motor_acceleration_limit: 2160 * @pi / 180))
+
+      assert {:ok, _state} = Actuator.init(opts)
+      assert_received {:acceleration, 246}
+    end
+
+    test "writes 0 when the joint declares no acceleration limit" do
+      test_pid = self()
+
+      BB.Process
+      |> stub(:call, fn _robot, _controller, msg ->
+        case msg do
+          {:write, _id, :torque_enable, false} -> :ok
+          {:read, _id, :model_number} -> {:ok, 777}
+          {:read, _id, :mode} -> {:ok, :position}
+          {:register_servo, _, _, _} -> {:ok, :table}
+          {:write, _id, :acceleration, raw} -> send(test_pid, {:acceleration, raw}) && :ok
+        end
+      end)
+
+      assert {:ok, _state} = Actuator.init(base_opts())
+      assert_received {:acceleration, 0}
+    end
+
+    test "rounds a tiny acceleration limit up rather than down to no limit" do
+      test_pid = self()
+
+      BB.Process
+      |> stub(:call, fn _robot, _controller, msg ->
+        case msg do
+          {:write, _id, :torque_enable, false} -> :ok
+          {:read, _id, :model_number} -> {:ok, 777}
+          {:read, _id, :mode} -> {:ok, :position}
+          {:register_servo, _, _, _} -> {:ok, :table}
+          {:write, _id, :acceleration, raw} -> send(test_pid, {:acceleration, raw}) && :ok
+        end
+      end)
+
+      opts = base_opts(motor_profile: motor_profile(motor_acceleration_limit: 0.001))
+
+      assert {:ok, _state} = Actuator.init(opts)
+      # 0 would mean "no limit" — the opposite of a very gentle one.
+      assert_received {:acceleration, 1}
+    end
+
+    test "refuses a joint accelerating harder than the register can express" do
+      opts = base_opts(motor_profile: motor_profile(motor_acceleration_limit: 100.0))
+
+      assert {:stop, %BB.Error.Invalid.JointConfig{field: :acceleration} = error} =
+               Actuator.init(opts)
+
+      assert error.message =~ "beyond the"
     end
 
     test "refuses a joint faster than the speed register can express" do
@@ -222,6 +296,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
         case msg do
           {:write, _id, :torque_enable, false} -> :ok
           {:read, _id, :mode} -> {:ok, :position}
+          {:write, _id, :acceleration, _} -> :ok
           {:register_servo, _, _, _} -> {:ok, servo_table}
         end
       end)
@@ -238,6 +313,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
           {:write, _id, :mode, _} -> flunk("rewrote a mode the servo was already in")
           {:read, _id, :model_number} -> {:ok, 777}
           {:read, _id, :mode} -> {:ok, :velocity}
+          {:write, _id, :acceleration, _} -> :ok
           {:register_servo, _, _, _} -> {:ok, :table}
         end
       end)
@@ -262,7 +338,8 @@ defmodule BB.Servo.Feetech.ActuatorTest do
 
       assert {:ok, _state} = Actuator.init(base_opts(mode: :velocity))
 
-      assert drain_messages() == [{:lock, false}, {:mode, :velocity}, {:lock, true}]
+      eeprom = Enum.filter(drain_messages(), fn {param, _} -> param in [:lock, :mode] end)
+      assert eeprom == [{:lock, false}, {:mode, :velocity}, {:lock, true}]
     end
   end
 
