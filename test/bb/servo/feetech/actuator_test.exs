@@ -39,6 +39,9 @@ defmodule BB.Servo.Feetech.ActuatorTest do
     setup do
       servo_table = :ets.new(:test_init_table, [:set, :public])
 
+      BB.Dsl.Info
+      |> stub(:controllers, fn TestRobot -> [%BB.Dsl.Controller{name: :feetech}] end)
+
       BB.Process
       |> stub(:call, fn _robot, _controller, msg ->
         case msg do
@@ -224,6 +227,39 @@ defmodule BB.Servo.Feetech.ActuatorTest do
                Actuator.init(opts)
 
       assert error.message =~ "beyond the"
+    end
+
+    test "refuses to start when :controller doesn't name a declared controller" do
+      BB.Dsl.Info
+      |> stub(:controllers, fn TestRobot ->
+        [%BB.Dsl.Controller{name: :dynamixel}, %BB.Dsl.Controller{name: :pca9685}]
+      end)
+
+      assert {:stop, %BB.Error.Invalid.Feetech.UnknownController{} = error} =
+               Actuator.init(base_opts())
+
+      assert error.controller == :feetech
+      assert error.actuator_path == [:shoulder, :servo]
+      assert error.known == [:dynamixel, :pca9685]
+
+      assert Exception.message(error) =~ "It has: :dynamixel, :pca9685"
+    end
+
+    test "says so plainly when the robot declares no controllers at all" do
+      BB.Dsl.Info |> stub(:controllers, fn TestRobot -> [] end)
+
+      assert {:stop, %BB.Error.Invalid.Feetech.UnknownController{known: []} = error} =
+               Actuator.init(base_opts())
+
+      assert Exception.message(error) =~ "no controllers at all"
+    end
+
+    test "checks the controller before touching the bus" do
+      BB.Dsl.Info |> stub(:controllers, fn TestRobot -> [] end)
+
+      BB.Process |> reject(:call, 3)
+
+      assert {:stop, %BB.Error.Invalid.Feetech.UnknownController{}} = Actuator.init(base_opts())
     end
 
     test "refuses to start when the controller says the servo ID is taken" do

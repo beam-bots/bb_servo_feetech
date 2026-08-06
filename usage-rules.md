@@ -159,6 +159,10 @@ chasing, so callers needn't pair the two.
 - **Don't declare a controller per servo, or give actuators a `port`.** One
   controller per bus; each actuator on it sets `controller:` to that entry's
   name and `servo_id:` to its address.
+- **Don't misname `controller:`.** It must match a controller declared in the
+  `controllers` block. The actuator checks the DSL at startup and refuses,
+  listing the controllers that do exist, rather than exiting with a bare
+  `:noproc` on its first call.
 - **Don't give two actuators the same `servo_id`.** The controller keys its
   shared table on the ID, so the second actuator would take over the first's
   row — the second one refuses to start instead. Two *servos* sharing an ID is

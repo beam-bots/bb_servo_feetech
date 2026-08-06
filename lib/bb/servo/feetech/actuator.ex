@@ -153,7 +153,9 @@ defmodule BB.Servo.Feetech.Actuator do
       ]
     ]
 
+  alias BB.Dsl.Info
   alias BB.Error.Invalid.Feetech.StallTorque, as: StallTorqueError
+  alias BB.Error.Invalid.Feetech.UnknownController, as: UnknownControllerError
   alias BB.Error.Invalid.JointConfig, as: JointConfigError
   alias BB.Message
   alias BB.Message.Actuator.Command
@@ -219,6 +221,7 @@ defmodule BB.Servo.Feetech.Actuator do
   @impl BB.Actuator
   def init(opts) do
     with {:ok, state} <- build_state(opts),
+         :ok <- validate_controller(state),
          :ok <- disable_torque(state),
          {:ok, state} <- resolve_stall_torque(state),
          :ok <- configure_mode(state),
@@ -369,6 +372,25 @@ defmodule BB.Servo.Feetech.Actuator do
 
   defp degrees(radians) do
     "#{:erlang.float_to_binary(radians * 180 / :math.pi(), decimals: 1)}°"
+  end
+
+  # Checked against the DSL rather than the registry, so the message can name
+  # the controllers that do exist. Every controller starts before any actuator,
+  # so a name that isn't declared is a typo rather than a race — and catching it
+  # here beats the bare `:noproc` the first call would otherwise exit with.
+  defp validate_controller(state) do
+    known = state.bb.robot |> Info.controllers() |> Enum.map(& &1.name) |> Enum.sort()
+
+    if state.controller in known do
+      :ok
+    else
+      {:error,
+       %UnknownControllerError{
+         controller: state.controller,
+         actuator_path: state.bb.path,
+         known: known
+       }}
+    end
   end
 
   defp disable_torque(state), do: write_param(state, :torque_enable, false)
