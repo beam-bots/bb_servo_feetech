@@ -152,6 +152,47 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       assert {:stop, %BB.Error.Invalid.JointConfig{field: :velocity}} = Actuator.init(opts)
     end
 
+    test "refuses a joint faster than the speed register can express" do
+      # The SO-101 declares 360 degree_per_second, which is exactly 4096
+      # steps/s — one past the end of a 0..4095 register.
+      opts = base_opts(motor_profile: motor_profile(motor_velocity_limit: 2 * @pi))
+
+      assert {:stop, %BB.Error.Invalid.JointConfig{field: :velocity} = error} =
+               Actuator.init(opts)
+
+      assert error.message =~ "faster than"
+    end
+
+    test "accepts a joint at exactly the top of the speed register" do
+      limit = 4095 * (2 * @pi / 4096)
+      opts = base_opts(motor_profile: motor_profile(motor_velocity_limit: limit))
+
+      assert {:ok, _state} = Actuator.init(opts)
+    end
+
+    test "refuses a joint that reaches past the encoder" do
+      opts = base_opts(motor_profile: motor_profile(motor_upper: @pi))
+
+      assert {:stop, %BB.Error.Invalid.JointConfig{field: :upper} = error} = Actuator.init(opts)
+      assert error.message =~ "beyond the"
+    end
+
+    test "refuses a joint that reaches below the encoder" do
+      opts = base_opts(motor_profile: motor_profile(motor_lower: -@pi - 0.1))
+
+      assert {:stop, %BB.Error.Invalid.JointConfig{field: :lower} = error} = Actuator.init(opts)
+      assert error.message =~ "below the"
+    end
+
+    test "accepts a joint spanning the full encoder" do
+      opts =
+        base_opts(
+          motor_profile: motor_profile(motor_lower: -@pi, motor_upper: 2047 * (2 * @pi / 4096))
+        )
+
+      assert {:ok, _state} = Actuator.init(opts)
+    end
+
     test "takes the stall torque from the model the servo reports" do
       assert {:ok, state} = Actuator.init(base_opts())
       assert_in_delta state.stall_torque, 1.912, 0.001
@@ -389,21 +430,6 @@ defmodule BB.Servo.Feetech.ActuatorTest do
                Actuator.handle_command(msg, state)
 
       assert_in_delta goal(servo_table, :goal_speed), @pi / 3, 0.001
-    end
-
-    test "keeps the speed inside the register when the joint is declared faster", %{
-      state: state,
-      servo_table: servo_table
-    } do
-      # The SO-101 declares 360 degree_per_second on every joint, which is
-      # exactly 4096 steps/s — one past the end of a 0..4095 register.
-      state = %{state | motor_profile: motor_profile(motor_velocity_limit: 2 * @pi)}
-
-      assert {:noreply, _state} =
-               Actuator.handle_command(%Message{payload: %Command.Position{position: 0.5}}, state)
-
-      raw = round(goal(servo_table, :goal_speed) / (2 * @pi / 4096))
-      assert raw == 4095
     end
 
     test "clamps a velocity hint above the joint's limit", %{

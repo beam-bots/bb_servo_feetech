@@ -185,13 +185,16 @@ defmodule BB.Servo.Feetech.Actuator do
   @position_resolution 4096
   @position_center 2048
 
-  # The speed register counts encoder steps per second, so it tops out one step
-  # short of a revolution per second — the same ceiling the position register
-  # has. A joint may be declared faster than that: the SO-101's
-  # `360 degree_per_second` lands on exactly 4096, one past the end. Writing it
-  # would put an out-of-range value on the bus, so speeds are clamped to the
-  # register as well as to the joint.
-  @max_motor_speed (@position_resolution - 1) * 2 * :math.pi() / @position_resolution
+  @radians_per_step 2 * :math.pi() / @position_resolution
+
+  # What the registers can express, in motor space. The encoder spans one
+  # revolution with motor zero at its midpoint, and the speed register counts
+  # those same steps per second. A joint declared outside these bounds cannot be
+  # driven as declared, so `init/1` refuses it rather than quietly writing
+  # something else — see `validate_motor_profile/2`.
+  @min_motor_angle -@position_center * @radians_per_step
+  @max_motor_angle (@position_resolution - 1 - @position_center) * @radians_per_step
+  @max_motor_speed (@position_resolution - 1) * @radians_per_step
 
   # ETS tuple field indices for command writes
   @ets_idx_pending_writes 10
@@ -287,7 +290,56 @@ defmodule BB.Servo.Feetech.Actuator do
      }}
   end
 
+  # The joint's declared limits are what `BeginMotion` computes arrival times
+  # from, and what callers clamp against. If the servo can't be driven to them,
+  # clamping quietly would put those predictions back out of step with the
+  # hardware — which is the whole problem writing the velocity limit set out to
+  # fix. Refuse instead, and say by how much.
+  defp validate_motor_profile(%{motor_lower: lower}, joint_name)
+       when lower < @min_motor_angle do
+    {:error,
+     %JointConfigError{
+       joint: joint_name,
+       field: :lower,
+       value: lower,
+       message:
+         "Joint reaches #{degrees(lower)} in motor space, below the " <>
+           "#{degrees(@min_motor_angle)} the servo's encoder can address"
+     }}
+  end
+
+  defp validate_motor_profile(%{motor_upper: upper}, joint_name)
+       when upper > @max_motor_angle do
+    {:error,
+     %JointConfigError{
+       joint: joint_name,
+       field: :upper,
+       value: upper,
+       message:
+         "Joint reaches #{degrees(upper)} in motor space, beyond the " <>
+           "#{degrees(@max_motor_angle)} the servo's encoder can address"
+     }}
+  end
+
+  defp validate_motor_profile(%{motor_velocity_limit: velocity}, joint_name)
+       when velocity > @max_motor_speed do
+    {:error,
+     %JointConfigError{
+       joint: joint_name,
+       field: :velocity,
+       value: velocity,
+       message:
+         "Joint is declared at #{degrees(velocity)}/s in motor space, faster " <>
+           "than the #{degrees(@max_motor_speed)}/s the servo's goal_speed " <>
+           "register can express"
+     }}
+  end
+
   defp validate_motor_profile(_profile, _joint_name), do: :ok
+
+  defp degrees(radians) do
+    "#{:erlang.float_to_binary(radians * 180 / :math.pi(), decimals: 1)}°"
+  end
 
   defp disable_torque(state), do: write_param(state, :torque_enable, false)
 
@@ -775,10 +827,10 @@ defmodule BB.Servo.Feetech.Actuator do
     |> Units.extract_float()
   end
 
-  # Velocity limits are magnitudes; the joint may travel either way.
-  defp clamp_speed(speed, state) do
-    limit = min(state.motor_profile.motor_velocity_limit, @max_motor_speed)
-
+  # Velocity limits are magnitudes; the joint may travel either way. Only what a
+  # caller asked for needs bounding — `init/1` has already established that the
+  # joint's own limit is something the register can express.
+  defp clamp_speed(speed, %{motor_profile: %{motor_velocity_limit: limit}}) do
     speed
     |> max(-limit)
     |> min(limit)

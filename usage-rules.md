@@ -108,6 +108,13 @@ Actuator (`{BB.Servo.Feetech.Actuator, opts}`):
 Position and velocity limits come from the joint's `limit` block, not actuator
 options — the actuator derives its motor profile from the topology.
 
+The actuator refuses to start if those limits are outside what the servo's
+registers can express: the encoder spans one revolution centred on motor zero
+(-180.0° to 179.9°), and `goal_speed` tops out at 359.9°/s. Both are checked in
+motor space, after the transmission. Clamping quietly instead would put the
+joint's declared limits — which is what `BeginMotion` computes arrival times
+from — out of step with what the servo actually does.
+
 ## Commands
 
 What the actuator accepts depends on its `:mode` — `Position`, `Trajectory`,
@@ -155,6 +162,11 @@ chasing, so callers needn't pair the two.
 - **Don't trust the default `:stall_torque` on a 12V STS3215.** All STS3215
   variants report model number 777, and the default is the 7.4V 1:345 figure
   (19.5 kgf·cm). A 12V C047 is 30 kgf·cm; set `stall_torque:` yourself.
+- **Don't declare a velocity limit the servo can't reach.** `360
+  degree_per_second` is a natural-looking round number and is 0.1°/s past the
+  end of the register; the actuator refuses to start rather than clamp. Declare
+  what the servo actually does — an STS3215 C001 manages roughly 333°/s at
+  7.4 V.
 - **Don't change `:mode` expecting it to take effect at runtime.** It is written
   to EEPROM once at startup, with torque off and the servo unlocked.
 - **Don't expect a servo to cut its own torque on disarm.** `Actuator.disarm/1`
