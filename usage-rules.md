@@ -101,9 +101,46 @@ Actuator (`{BB.Servo.Feetech.Actuator, opts}`):
 | `:servo_id` | required | Servo address on the bus, `1..253` |
 | `:controller` | required | Name of the controller entry in the DSL |
 | `:position_deadband` | `2` | Min raw-unit change before publishing feedback |
+| `:mode` | `:position` | Operating mode; also `:velocity` |
+| `:stall_torque` | from the model | Rated stall torque in Nm, for scaling `Effort` |
+| `:expiry_action` | `:stop` | `:hold` to stay under power when a `duration` runs out |
 
 Position and velocity limits come from the joint's `limit` block, not actuator
 options — the actuator derives its motor profile from the topology.
+
+## Commands
+
+What the actuator accepts depends on its `:mode` — `Position`, `Trajectory`,
+`Effort`, `Hold` and `Stop` in `:position`; `Velocity`, `Effort`, `Hold` and
+`Stop` in `:velocity`. Anything else is refused with
+`BB.Error.State.UnsupportedCommand` before it reaches the driver.
+
+```elixir
+# Arm first — a disarmed robot refuses commands
+{:ok, cmd} = MyRobot.arm()
+{:ok, :armed, _} = BB.Command.await(cmd)
+
+BB.Actuator.set_position(MyRobot, :servo, 0.5)
+
+# Go passive — the joint can be backdriven by hand, and will sag under load
+BB.Actuator.stop(MyRobot, :servo)
+
+# Back under power, holding wherever it came to rest
+BB.Actuator.hold(MyRobot, :servo)
+
+# Only in an actuator configured `mode: :velocity`
+BB.Actuator.set_velocity(MyRobot, :wheel, 2.0, duration: 500)
+
+# A ceiling, not a goal — won't move anything on its own
+BB.Actuator.set_effort(MyRobot, :gripper, 0.4)
+```
+
+`stop/3` is not the safety path: it leaves the robot armed and commandable.
+Making the hardware safe is `MyRobot.disarm()`, which is robot-wide.
+
+Any motion command sent to a joint left passive by `Stop` re-applies torque on
+the way past, at the position the joint came to rest rather than the goal it was
+chasing, so callers needn't pair the two.
 
 ## Anti-patterns
 
@@ -111,8 +148,15 @@ options — the actuator derives its motor profile from the topology.
   controller per bus; each actuator on it sets `controller:` to that entry's
   name and `servo_id:` to its address.
 - **Don't pass `reversed?`/`offset` as actuator options.** Direction and
-  zero-offset live in the joint's `transmission do … end` block; the actuator
-  schema accepts only `servo_id`, `controller`, and `position_deadband`.
+  zero-offset live in the joint's `transmission do … end` block.
+- **Don't expect `set_effort/4` to move anything.** These servos have no torque
+  goal. `Effort` writes `torque_limit`, a ceiling on what a move may draw — pair
+  it with a position or velocity command.
+- **Don't trust the default `:stall_torque` on a 12V STS3215.** All STS3215
+  variants report model number 777, and the default is the 7.4V 1:345 figure
+  (19.5 kgf·cm). A 12V C047 is 30 kgf·cm; set `stall_torque:` yourself.
+- **Don't change `:mode` expecting it to take effect at runtime.** It is written
+  to EEPROM once at startup, with torque off and the servo unlocked.
 - **Don't expect a servo to cut its own torque on disarm.** `Actuator.disarm/1`
   is a no-op; the controller disables torque for all servo IDs. Note that
   `disarm_action: :hold` keeps torque *on* — it holds position, it does not

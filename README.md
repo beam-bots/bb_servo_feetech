@@ -27,6 +27,8 @@ PWM servos, Feetech serial bus servos provide closed-loop position feedback.
 
 - **Closed-loop position feedback** - Servos report their actual position
 - **Multiple servos on one bus** - All servos share a single serial connection
+- **Position and velocity modes** - Continuous rotation as well as positioning
+- **Stop and hold** - Go passive on command, and come back under power without lunging
 - **Safety integration** - Torque is automatically disabled when the robot is disarmed or crashes
 - **Status monitoring** - Temperature, voltage, load, and hardware error reporting
 - **Parameter access** - Read and write servo configuration via the BB parameter system
@@ -166,6 +168,56 @@ case BB.Actuator.set_position_sync(MyRobot, :shoulder_servo, 0.5) do
 end
 ```
 
+### Stopping, Holding, and Other Modes
+
+What an actuator accepts depends on its `mode`. Anything outside that list is
+refused with `BB.Error.State.UnsupportedCommand` before it reaches the driver.
+
+| `mode` | commands |
+|---|---|
+| `:position` (default) | `Position`, `Trajectory`, `Effort`, `Hold`, `Stop` |
+| `:velocity` | `Velocity`, `Effort`, `Hold`, `Stop` |
+
+```elixir
+# Go passive — the joint can be backdriven by hand, and will sag under load
+BB.Actuator.stop(MyRobot, :shoulder_servo)
+
+# Back under power, holding wherever it came to rest
+BB.Actuator.hold(MyRobot, :shoulder_servo)
+
+# Only in an actuator configured `mode: :velocity`
+BB.Actuator.set_velocity(MyRobot, :wheel_servo, 2.0, duration: 500)
+```
+
+`stop/3` is not the safety path: it leaves the robot armed and commandable.
+Making the hardware safe is `MyRobot.disarm()`, which is robot-wide.
+
+A joint left passive by a `Stop` comes back under power on the next motion
+command, at the position it came to rest rather than the goal it was chasing
+when torque was cut — so callers don't have to pair `stop` with `hold`.
+
+### Effort is a Ceiling, Not a Goal
+
+STS servos have no torque goal register. `Command.Effort` writes `torque_limit`,
+which caps what a move may draw:
+
+```elixir
+# Cap the gripper at 0.4 Nm, then close it — it squeezes to the limit
+BB.Actuator.set_effort(MyRobot, :gripper_servo, 0.4)
+BB.Actuator.set_position(MyRobot, :gripper_servo, 0.0)
+```
+
+Setting an effort on its own moves nothing. The newton-metre figure is scaled
+against the servo's rated stall torque, which no register reports — it comes
+from `BB.Servo.Feetech.Model`, keyed on the model number the servo reports.
+
+That number is a rough guide. Every STS3215 variant reports `777`, whether it is
+the 7.4 V 1:345 (19.5 kgf·cm), the 7.4 V 1:191 (27.4 kgf·cm), or the 12 V 1:345
+(30 kgf·cm). The table carries the first of those; set `stall_torque:` on the
+actuator if you have one of the others. Stall torque also falls with supply
+voltage, and the servo's own overload protection can wind the ceiling down under
+sustained load.
+
 ## Components
 
 ### Controller
@@ -200,6 +252,9 @@ bus. Define one controller per serial adapter. The controller handles:
 | `servo_id` | 1-253 | required | Feetech servo ID |
 | `controller` | atom | required | Name of the controller in robot registry |
 | `position_deadband` | integer | 2 | Minimum position change (raw units) to publish feedback |
+| `mode` | `:position` \| `:velocity` | `:position` | Operating mode, fixed at startup |
+| `stall_torque` | float \| nil | from the model | Rated stall torque (Nm), for scaling effort |
+| `expiry_action` | `:stop` \| `:hold` | `:stop` | What to do when a command's `duration` runs out |
 
 Configure direction reversal on the joint transmission, not as an actuator
 option:
@@ -276,7 +331,7 @@ end
 
 Parameter categories:
 
-- **info** - Read-only identification (firmware_version, servo_version)
+- **info** - Read-only identification (firmware_version, model_number)
 - **config** - EEPROM settings, require torque off to write (limits, gains, mode)
 - **control** - SRAM settings, writable at runtime (goal_position, torque_enable)
 
@@ -356,6 +411,10 @@ are some differences in the underlying servo protocol:
 | Load reporting | `present_load` (percentage) | `present_current` (mA) |
 | Status byte bit 4 | Torque enabled (not an error) | Hardware error |
 | Sync read | Returns list of values | Callback-based |
+| Operating modes | Position, velocity | Position, velocity, current, current-position |
+| Effort | A ceiling on a move (`torque_limit`) | A torque goal (`goal_current`) |
+| Mode switching | EEPROM write, finite budget | Resets PID gains and profile settings |
+| Trajectories | Supported | Not implemented |
 
 ## Documentation
 
