@@ -389,6 +389,21 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       assert_in_delta goal(servo_table, :goal_speed), @pi / 3, 0.001
     end
 
+    test "keeps the speed inside the register when the joint is declared faster", %{
+      state: state,
+      servo_table: servo_table
+    } do
+      # The SO-101 declares 360 degree_per_second on every joint, which is
+      # exactly 4096 steps/s — one past the end of a 0..4095 register.
+      state = %{state | motor_profile: motor_profile(motor_velocity_limit: 2 * @pi)}
+
+      assert {:noreply, _state} =
+               Actuator.handle_command(%Message{payload: %Command.Position{position: 0.5}}, state)
+
+      raw = round(goal(servo_table, :goal_speed) / (2 * @pi / 4096))
+      assert raw == 4095
+    end
+
     test "clamps a velocity hint above the joint's limit", %{
       state: state,
       servo_table: servo_table

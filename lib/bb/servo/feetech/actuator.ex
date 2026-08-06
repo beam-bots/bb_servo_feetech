@@ -182,6 +182,14 @@ defmodule BB.Servo.Feetech.Actuator do
   @position_resolution 4096
   @position_center 2048
 
+  # The speed register counts encoder steps per second, so it tops out one step
+  # short of a revolution per second — the same ceiling the position register
+  # has. A joint may be declared faster than that: the SO-101's
+  # `360 degree_per_second` lands on exactly 4096, one past the end. Writing it
+  # would put an out-of-range value on the bus, so speeds are clamped to the
+  # register as well as to the joint.
+  @max_motor_speed (@position_resolution - 1) * 2 * :math.pi() / @position_resolution
+
   # ETS tuple field indices for command writes
   @ets_idx_pending_writes 10
   @ets_idx_pending_limit 11
@@ -406,11 +414,9 @@ defmodule BB.Servo.Feetech.Actuator do
   end
 
   def handle_command(%Message{payload: %Command.Velocity{} = cmd}, state) do
-    velocity = clamp(cmd.velocity, state.motor_profile.motor_velocity_limit)
-
     state
     |> schedule_expiry(cmd.duration)
-    |> apply_and_reply([{:goal_speed, velocity}])
+    |> apply_and_reply([{:goal_speed, clamp_speed(cmd.velocity, state)}])
   end
 
   # There is no torque goal on these servos. `torque_limit` is a ceiling on what
@@ -589,16 +595,16 @@ defmodule BB.Servo.Feetech.Actuator do
   # makes it real. Anything the caller asks for is clamped to it too.
   defp compute_goal_speed(%Command.Position{velocity: velocity}, _clamped_angle, state)
        when is_number(velocity),
-       do: min(abs(velocity), state.motor_profile.motor_velocity_limit)
+       do: clamp_speed(abs(velocity), state)
 
   defp compute_goal_speed(%Command.Position{duration: duration}, clamped_motor_angle, state)
        when is_integer(duration) and duration > 0 do
     travel_distance = abs(state.current_motor_angle - clamped_motor_angle)
-    min(travel_distance / (duration / 1000), state.motor_profile.motor_velocity_limit)
+    clamp_speed(travel_distance / (duration / 1000), state)
   end
 
   defp compute_goal_speed(_cmd, _clamped_angle, state),
-    do: state.motor_profile.motor_velocity_limit
+    do: clamp_speed(state.motor_profile.motor_velocity_limit, state)
 
   defp clear_pending_writes(state) do
     update_row(state, [{@ets_idx_pending_writes, nil}, {@ets_idx_pending_limit, nil}])
@@ -717,13 +723,12 @@ defmodule BB.Servo.Feetech.Actuator do
   # A waypoint with no velocity of its own travels at the joint's limit rather
   # than at the servo's maximum, the same as a bare position command.
   defp waypoint_speed(waypoint, state) do
-    limit = state.motor_profile.motor_velocity_limit
     velocity = waypoint[:velocity]
 
     if is_number(velocity) and velocity != 0 do
-      min(abs(velocity), limit)
+      clamp_speed(abs(velocity), state)
     else
-      limit
+      clamp_speed(state.motor_profile.motor_velocity_limit, state)
     end
   end
 
@@ -760,8 +765,10 @@ defmodule BB.Servo.Feetech.Actuator do
   end
 
   # Velocity limits are magnitudes; the joint may travel either way.
-  defp clamp(value, limit) do
-    value
+  defp clamp_speed(speed, state) do
+    limit = min(state.motor_profile.motor_velocity_limit, @max_motor_speed)
+
+    speed
     |> max(-limit)
     |> min(limit)
   end
