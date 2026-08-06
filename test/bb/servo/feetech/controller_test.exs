@@ -223,7 +223,7 @@ defmodule BB.Servo.Feetech.ControllerTest do
 
       [
         {1, actuator_path, deadband, last_pos, present_pos, present_temp, present_voltage,
-         present_load, hw_error, goal_pos, goal_speed}
+         present_load, hw_error, pending_writes, torque_enabled}
       ] =
         :ets.lookup(state.servo_table, 1)
 
@@ -235,8 +235,8 @@ defmodule BB.Servo.Feetech.ControllerTest do
       assert present_voltage == nil
       assert present_load == nil
       assert hw_error == nil
-      assert goal_pos == nil
-      assert goal_speed == nil
+      assert pending_writes == nil
+      assert torque_enabled == false
     end
 
     test "registers multiple servos", %{state: state} do
@@ -286,7 +286,8 @@ defmodule BB.Servo.Feetech.ControllerTest do
 
     test "forwards write to Feetech with await", %{state: state} do
       Feetech
-      |> expect(:write, fn pid, 1, :torque_enable, true, [await_response: true] when is_pid(pid) ->
+      |> expect(:write, fn pid, 1, :torque_enable, true, [await_response: true]
+                           when is_pid(pid) ->
         :ok
       end)
 
@@ -296,12 +297,134 @@ defmodule BB.Servo.Feetech.ControllerTest do
 
     test "forwards write_raw to Feetech with await", %{state: state} do
       Feetech
-      |> expect(:write_raw, fn pid, 1, :goal_position, 2048, [await_response: true] when is_pid(pid) ->
+      |> expect(:write_raw, fn pid, 1, :goal_position, 2048, [await_response: true]
+                               when is_pid(pid) ->
         :ok
       end)
 
       message = {:write_raw, 1, :goal_position, 2048}
       assert {:reply, :ok, ^state} = Controller.handle_call(message, {self(), make_ref()}, state)
+    end
+  end
+
+  describe "torque state caching" do
+    setup :controller_state_with_servos
+
+    test "a torque_enable write updates the cache", %{state: state, servo_table: servo_table} do
+      Feetech
+      |> expect(:write, fn _pid, 1, :torque_enable, true, _opts -> :ok end)
+
+      Controller.handle_call({:write, 1, :torque_enable, true}, {self(), make_ref()}, state)
+
+      assert torque_enabled?(servo_table, 1)
+    end
+
+    test "a raw torque_enable write updates the cache", %{
+      state: state,
+      servo_table: servo_table
+    } do
+      :ets.update_element(servo_table, 1, [{11, true}])
+
+      Feetech
+      |> expect(:write_raw, fn _pid, 1, :torque_enable, 0, _opts -> :ok end)
+
+      Controller.handle_call({:write_raw, 1, :torque_enable, 0}, {self(), make_ref()}, state)
+
+      refute torque_enabled?(servo_table, 1)
+    end
+
+    test "a failed write leaves the cache alone", %{state: state, servo_table: servo_table} do
+      Feetech
+      |> expect(:write, fn _pid, 1, :torque_enable, true, _opts -> {:error, :timeout} end)
+
+      Controller.handle_call({:write, 1, :torque_enable, true}, {self(), make_ref()}, state)
+
+      refute torque_enabled?(servo_table, 1)
+    end
+
+    test "writes to other params don't touch it", %{state: state, servo_table: servo_table} do
+      Feetech
+      |> expect(:write_raw, fn _pid, 1, :goal_position, 2048, _opts -> :ok end)
+
+      Controller.handle_call({:write_raw, 1, :goal_position, 2048}, {self(), make_ref()}, state)
+
+      refute torque_enabled?(servo_table, 1)
+    end
+  end
+
+  describe "handle_call/3 - resume_servo" do
+    setup :controller_state_with_servos
+
+    test "writes the goal before turning torque on", %{state: state} do
+      test_pid = self()
+
+      Feetech
+      |> expect(:write_raw, fn _pid, 1, :goal_position, 2048, [await_response: true] ->
+        send(test_pid, :goal_position)
+        :ok
+      end)
+      |> expect(:write, fn _pid, 1, :torque_enable, true, [await_response: true] ->
+        send(test_pid, :torque_enable)
+        :ok
+      end)
+
+      message = {:resume_servo, 1, [{:goal_position, 2048}]}
+      assert {:reply, :ok, _state} = Controller.handle_call(message, {self(), make_ref()}, state)
+
+      assert drain_messages() == [:goal_position, :torque_enable]
+    end
+
+    test "resolves :present_position against the bus", %{state: state} do
+      Feetech
+      |> expect(:read_raw, fn _pid, 1, :present_position -> {:ok, 1234} end)
+      |> expect(:write_raw, fn _pid, 1, :goal_position, 1234, _opts -> :ok end)
+      |> expect(:write, fn _pid, 1, :torque_enable, true, _opts -> :ok end)
+
+      message = {:resume_servo, 1, [{:present_position, nil}]}
+      assert {:reply, :ok, _state} = Controller.handle_call(message, {self(), make_ref()}, state)
+    end
+
+    test "caches the torque state and clears the pending write", %{
+      state: state,
+      servo_table: servo_table
+    } do
+      :ets.update_element(servo_table, 1, [{10, [goal_position: 9999]}])
+
+      Feetech
+      |> expect(:write_raw, fn _pid, 1, :goal_position, 2048, _opts -> :ok end)
+      |> expect(:write, fn _pid, 1, :torque_enable, true, _opts -> :ok end)
+
+      message = {:resume_servo, 1, [{:goal_position, 2048}]}
+      assert {:reply, :ok, _state} = Controller.handle_call(message, {self(), make_ref()}, state)
+
+      [{1, _, _, _, _, _, _, _, _, pending_writes, _}] = :ets.lookup(servo_table, 1)
+      assert pending_writes == nil
+      assert torque_enabled?(servo_table, 1)
+    end
+
+    test "torque stays off when the goal write fails", %{
+      state: state,
+      servo_table: servo_table
+    } do
+      Feetech
+      |> expect(:write_raw, fn _pid, 1, :goal_position, 2048, _opts -> {:error, :timeout} end)
+      |> reject(:write, 5)
+
+      message = {:resume_servo, 1, [{:goal_position, 2048}]}
+
+      assert {:reply, {:error, {:servo, 1, :goal_position, :timeout}}, _state} =
+               Controller.handle_call(message, {self(), make_ref()}, state)
+
+      refute torque_enabled?(servo_table, 1)
+    end
+
+    test "a converted param goes through the control table", %{state: state} do
+      Feetech
+      |> expect(:write, fn _pid, 1, :goal_speed, -1.5, [await_response: true] -> :ok end)
+      |> expect(:write, fn _pid, 1, :torque_enable, true, _opts -> :ok end)
+
+      message = {:resume_servo, 1, [{:goal_speed, -1.5}]}
+      assert {:reply, :ok, _state} = Controller.handle_call(message, {self(), make_ref()}, state)
     end
   end
 
@@ -311,12 +434,12 @@ defmodule BB.Servo.Feetech.ControllerTest do
 
       :ets.insert(
         base.servo_table,
-        {1, [:shoulder, :servo], 2, nil, nil, nil, nil, nil, nil, nil, nil}
+        {1, [:shoulder, :servo], 2, nil, nil, nil, nil, nil, nil, nil, false}
       )
 
       :ets.insert(
         base.servo_table,
-        {2, [:elbow, :servo], 2, nil, nil, nil, nil, nil, nil, nil, nil}
+        {2, [:elbow, :servo], 2, nil, nil, nil, nil, nil, nil, nil, false}
       )
 
       state = %{base.state | servo_ids: [1, 2]}
@@ -356,13 +479,18 @@ defmodule BB.Servo.Feetech.ControllerTest do
   describe "handle_info(:tick) - command processing" do
     setup :controller_state_with_servos
 
-    test "batches pending goal positions into sync_write_raw", %{state: state} do
-      :ets.update_element(state.servo_table, 1, [{10, 2048}, {11, 0}])
-      :ets.update_element(state.servo_table, 2, [{10, 3000}, {11, 1.5}])
+    test "batches each pending param into one sync_write across servos", %{state: state} do
+      :ets.update_element(state.servo_table, 1, [
+        {10, [goal_speed: 0.0, goal_position: 2048]}
+      ])
+
+      :ets.update_element(state.servo_table, 2, [
+        {10, [goal_speed: 1.5, goal_position: 3000]}
+      ])
 
       Feetech
       |> expect(:sync_write, fn pid, :goal_speed, values when is_pid(pid) ->
-        assert {1, 0} in values
+        assert {1, 0.0} in values
         assert {2, 1.5} in values
         :ok
       end)
@@ -380,11 +508,36 @@ defmodule BB.Servo.Feetech.ControllerTest do
 
       assert {:noreply, _state} = Controller.handle_info(:tick, state)
 
-      [{1, _, _, _, _, _, _, _, _, goal_pos, goal_speed}] =
+      [{1, _, _, _, _, _, _, _, _, pending_writes, _}] =
         :ets.lookup(state.servo_table, 1)
 
-      assert goal_pos == nil
-      assert goal_speed == nil
+      assert pending_writes == nil
+    end
+
+    test "writes the torque ceiling before the goal that might reach it", %{state: state} do
+      :ets.update_element(state.servo_table, 1, [
+        {10, [goal_position: 2048, torque_limit: 0.25]}
+      ])
+
+      test_pid = self()
+
+      Feetech
+      |> expect(:sync_write, fn _pid, :torque_limit, [{1, 0.25}] ->
+        send(test_pid, :torque_limit)
+        :ok
+      end)
+      |> expect(:sync_write_raw, fn _pid, :goal_position, [{1, 2048}] ->
+        send(test_pid, :goal_position)
+        :ok
+      end)
+      |> expect(:sync_read, fn _pid, [1, 2], :present_position -> {:ok, [3.14, 1.57]} end)
+
+      BB
+      |> stub(:publish, fn _robot, _path, _msg -> :ok end)
+
+      assert {:noreply, _state} = Controller.handle_info(:tick, state)
+
+      assert drain_messages() == [:torque_limit, :goal_position]
     end
 
     test "skips sync_write when no commands pending", %{state: state} do
@@ -542,12 +695,12 @@ defmodule BB.Servo.Feetech.ControllerTest do
 
     :ets.insert(
       base.servo_table,
-      {1, [:shoulder, :servo], 2, nil, nil, nil, nil, nil, nil, nil, nil}
+      {1, [:shoulder, :servo], 2, nil, nil, nil, nil, nil, nil, nil, false}
     )
 
     :ets.insert(
       base.servo_table,
-      {2, [:elbow, :servo], 2, nil, nil, nil, nil, nil, nil, nil, nil}
+      {2, [:elbow, :servo], 2, nil, nil, nil, nil, nil, nil, nil, false}
     )
 
     BB.Actuator
@@ -556,5 +709,20 @@ defmodule BB.Servo.Feetech.ControllerTest do
     state = %{base.state | servo_ids: [1, 2]}
 
     %{state: state, servo_table: base.servo_table}
+  end
+
+  defp torque_enabled?(servo_table, servo_id) do
+    [{^servo_id, _, _, _, _, _, _, _, _, _, torque_enabled}] =
+      :ets.lookup(servo_table, servo_id)
+
+    torque_enabled
+  end
+
+  defp drain_messages(acc \\ []) do
+    receive do
+      message -> drain_messages([message | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
   end
 end

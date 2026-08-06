@@ -41,6 +41,8 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       |> stub(:call, fn _robot, _controller, msg ->
         case msg do
           {:write, _id, :torque_enable, false} -> :ok
+          {:read, _id, :model_number} -> {:ok, 777}
+          {:read, _id, :mode} -> {:ok, :position}
           {:register_servo, _, _, _} -> {:ok, servo_table}
         end
       end)
@@ -74,10 +76,16 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       assert is_nil(state.trajectory_timer)
     end
 
-    test "disables torque on init" do
+    test "disables torque on init", %{servo_table: servo_table} do
       BB.Process
       |> expect(:call, fn TestRobot, :feetech, {:write, 1, :torque_enable, false} -> :ok end)
-      |> stub(:call, fn _robot, _controller, _msg -> {:ok, :stub_table} end)
+      |> stub(:call, fn _robot, _controller, msg ->
+        case msg do
+          {:read, _id, :model_number} -> {:ok, 777}
+          {:read, _id, :mode} -> {:ok, :position}
+          {:register_servo, _, _, _} -> {:ok, servo_table}
+        end
+      end)
 
       opts = [
         bb: %{robot: TestRobot, path: [:shoulder, :servo]},
@@ -92,6 +100,8 @@ defmodule BB.Servo.Feetech.ActuatorTest do
     test "registers with controller, passing its own actuator path", %{servo_table: servo_table} do
       BB.Process
       |> expect(:call, fn TestRobot, :feetech, {:write, 1, :torque_enable, false} -> :ok end)
+      |> expect(:call, fn TestRobot, :feetech, {:read, 1, :model_number} -> {:ok, 777} end)
+      |> expect(:call, fn TestRobot, :feetech, {:read, 1, :mode} -> {:ok, :position} end)
       |> expect(:call, fn TestRobot, :feetech, {:register_servo, 1, [:shoulder, :servo], 2} ->
         {:ok, servo_table}
       end)
@@ -139,6 +149,78 @@ defmodule BB.Servo.Feetech.ActuatorTest do
 
       assert {:stop, %BB.Error.Invalid.JointConfig{field: :velocity}} = Actuator.init(opts)
     end
+
+    test "takes the stall torque from the model the servo reports" do
+      assert {:ok, state} = Actuator.init(base_opts())
+      assert_in_delta state.stall_torque, 1.912, 0.001
+    end
+
+    test "prefers a configured stall torque over the model's" do
+      assert {:ok, state} = Actuator.init(base_opts(stall_torque: 3.5))
+      assert_in_delta state.stall_torque, 3.5, 0.001
+    end
+
+    test "refuses to start when the model is unknown and no stall torque is given" do
+      BB.Process
+      |> stub(:call, fn _robot, _controller, msg ->
+        case msg do
+          {:write, _id, :torque_enable, false} -> :ok
+          {:read, _id, :model_number} -> {:ok, 4242}
+        end
+      end)
+
+      assert {:stop, %BB.Error.Invalid.Feetech.StallTorque{model_number: 4242, servo_id: 1}} =
+               Actuator.init(base_opts())
+    end
+
+    test "starts an unknown model when the stall torque is given", %{servo_table: servo_table} do
+      BB.Process
+      |> stub(:call, fn _robot, _controller, msg ->
+        case msg do
+          {:write, _id, :torque_enable, false} -> :ok
+          {:read, _id, :mode} -> {:ok, :position}
+          {:register_servo, _, _, _} -> {:ok, servo_table}
+        end
+      end)
+
+      assert {:ok, state} = Actuator.init(base_opts(stall_torque: 3.5))
+      assert_in_delta state.stall_torque, 3.5, 0.001
+    end
+
+    test "leaves the mode alone when the servo is already in it" do
+      BB.Process
+      |> stub(:call, fn _robot, _controller, msg ->
+        case msg do
+          {:write, _id, :torque_enable, false} -> :ok
+          {:write, _id, :mode, _} -> flunk("rewrote a mode the servo was already in")
+          {:read, _id, :model_number} -> {:ok, 777}
+          {:read, _id, :mode} -> {:ok, :velocity}
+          {:register_servo, _, _, _} -> {:ok, :table}
+        end
+      end)
+
+      assert {:ok, state} = Actuator.init(base_opts(mode: :velocity))
+      assert state.mode == :velocity
+    end
+
+    test "unlocks the EEPROM around a mode change, and locks it again" do
+      test_pid = self()
+
+      BB.Process
+      |> stub(:call, fn _robot, _controller, msg ->
+        case msg do
+          {:write, _id, :torque_enable, false} -> :ok
+          {:read, _id, :model_number} -> {:ok, 777}
+          {:read, _id, :mode} -> {:ok, :position}
+          {:register_servo, _, _, _} -> {:ok, :table}
+          {:write, _id, param, value} -> send(test_pid, {param, value}) && :ok
+        end
+      end)
+
+      assert {:ok, _state} = Actuator.init(base_opts(mode: :velocity))
+
+      assert drain_messages() == [{:lock, false}, {:mode, :velocity}, {:lock, true}]
+    end
   end
 
   describe "position conversion" do
@@ -151,9 +233,10 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       assert {:noreply, _new_state} =
                Actuator.handle_command(msg, state)
 
-      [{1, _, _, _, _, _, _, _, _, goal_position, goal_speed}] = :ets.lookup(servo_table, 1)
+      goal_position = goal(servo_table, :goal_position)
+      goal_speed = goal(servo_table, :goal_speed)
       assert goal_position == 2048
-      assert goal_speed == 0
+      assert_in_delta goal_speed, @pi / 3, 0.001
     end
 
     test "converts positive angle to higher servo position", %{
@@ -166,7 +249,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       assert {:noreply, _new_state} =
                Actuator.handle_command(msg, state)
 
-      [{1, _, _, _, _, _, _, _, _, goal_position, _}] = :ets.lookup(servo_table, 1)
+      goal_position = goal(servo_table, :goal_position)
       # pi/4 radians = 45 degrees = 512 steps from center
       # 2048 + 512 = 2560
       assert_in_delta goal_position, 2560, 1
@@ -182,7 +265,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       assert {:noreply, _new_state} =
                Actuator.handle_command(msg, state)
 
-      [{1, _, _, _, _, _, _, _, _, goal_position, _}] = :ets.lookup(servo_table, 1)
+      goal_position = goal(servo_table, :goal_position)
       # -pi/4 radians = -45 degrees = -512 steps from center
       # 2048 - 512 = 1536
       assert_in_delta goal_position, 1536, 1
@@ -201,7 +284,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
 
       assert_in_delta new_state.current_motor_angle, @pi / 2, 0.001
 
-      [{1, _, _, _, _, _, _, _, _, goal_position, _}] = :ets.lookup(servo_table, 1)
+      goal_position = goal(servo_table, :goal_position)
       # Position should be clamped to upper limit (pi/2)
       # pi/2 = 1024 steps from center = 2048 + 1024 = 3072
       assert_in_delta goal_position, 3072, 1
@@ -216,7 +299,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
 
       assert_in_delta new_state.current_motor_angle, -@pi / 2, 0.001
 
-      [{1, _, _, _, _, _, _, _, _, goal_position, _}] = :ets.lookup(servo_table, 1)
+      goal_position = goal(servo_table, :goal_position)
       # Position should be clamped to lower limit (-pi/2)
       # -pi/2 = -1024 steps from center = 2048 - 1024 = 1024
       assert_in_delta goal_position, 1024, 1
@@ -272,7 +355,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       assert {:noreply, _state} =
                Actuator.handle_command(msg, state)
 
-      [{1, _, _, _, _, _, _, _, _, _, goal_speed}] = :ets.lookup(servo_table, 1)
+      goal_speed = goal(servo_table, :goal_speed)
       assert_in_delta goal_speed, 1.0, 0.001
     end
 
@@ -293,7 +376,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
                Actuator.handle_command(msg, state)
     end
 
-    test "resets goal_speed to 0 when no hints provided", %{
+    test "falls back to the joint's velocity limit when no hints provided", %{
       state: state,
       servo_table: servo_table
     } do
@@ -303,8 +386,20 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       assert {:noreply, _state} =
                Actuator.handle_command(msg, state)
 
-      [{1, _, _, _, _, _, _, _, _, _, goal_speed}] = :ets.lookup(servo_table, 1)
-      assert goal_speed == 0
+      assert_in_delta goal(servo_table, :goal_speed), @pi / 3, 0.001
+    end
+
+    test "clamps a velocity hint above the joint's limit", %{
+      state: state,
+      servo_table: servo_table
+    } do
+      cmd = %Command.Position{position: 0.5, velocity: 100.0}
+      msg = %Message{payload: cmd}
+
+      assert {:noreply, _state} =
+               Actuator.handle_command(msg, state)
+
+      assert_in_delta goal(servo_table, :goal_speed), @pi / 3, 0.001
     end
   end
 
@@ -321,7 +416,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       assert {:noreply, _state} =
                Actuator.handle_command(msg, state)
 
-      [{1, _, _, _, _, _, _, _, _, _, goal_speed}] = :ets.lookup(servo_table, 1)
+      goal_speed = goal(servo_table, :goal_speed)
       # Moving 0.5 rad in 500ms → velocity = 0.5 / 0.5 = 1.0 rad/s
       assert_in_delta goal_speed, 1.0, 0.001
     end
@@ -345,14 +440,14 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       state: state,
       servo_table: servo_table
     } do
-      cmd = %Command.Position{position: 0.5, velocity: 2.0, duration: 5000}
+      cmd = %Command.Position{position: 0.5, velocity: 0.8, duration: 5000}
       msg = %Message{payload: cmd}
 
       assert {:noreply, _state} =
                Actuator.handle_command(msg, state)
 
-      [{1, _, _, _, _, _, _, _, _, _, goal_speed}] = :ets.lookup(servo_table, 1)
-      assert_in_delta goal_speed, 2.0, 0.001
+      goal_speed = goal(servo_table, :goal_speed)
+      assert_in_delta goal_speed, 0.8, 0.001
     end
   end
 
@@ -376,7 +471,8 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       assert new_state.trajectory.index == 0
       assert_in_delta new_state.current_motor_angle, 0.5, 0.001
 
-      [{1, _, _, _, _, _, _, _, _, goal_position, goal_speed}] = :ets.lookup(servo_table, 1)
+      goal_position = goal(servo_table, :goal_position)
+      goal_speed = goal(servo_table, :goal_speed)
       assert goal_position != nil
       assert_in_delta goal_speed, 1.0, 0.001
     end
@@ -416,7 +512,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
 
       assert_in_delta new_state.current_motor_angle, @pi / 2, 0.001
 
-      [{1, _, _, _, _, _, _, _, _, goal_position, _}] = :ets.lookup(servo_table, 1)
+      goal_position = goal(servo_table, :goal_position)
       # pi should be clamped to pi/2 = 3072
       assert_in_delta goal_position, 3072, 1
     end
@@ -580,14 +676,343 @@ defmodule BB.Servo.Feetech.ActuatorTest do
     end
   end
 
+  describe "command_payloads/1" do
+    test "position mode admits position, trajectory, effort, hold and stop" do
+      assert Actuator.command_payloads(mode: :position) ==
+               Enum.sort([
+                 Command.Effort,
+                 Command.Hold,
+                 Command.Position,
+                 Command.Stop,
+                 Command.Trajectory
+               ])
+    end
+
+    test "velocity mode admits velocity, effort, hold and stop" do
+      assert Actuator.command_payloads(mode: :velocity) ==
+               Enum.sort([Command.Effort, Command.Hold, Command.Stop, Command.Velocity])
+    end
+
+    test "defaults to position mode" do
+      assert Actuator.command_payloads([]) == Actuator.command_payloads(mode: :position)
+    end
+
+    test "position mode does not admit velocity" do
+      refute Command.Velocity in Actuator.command_payloads(mode: :position)
+    end
+
+    test "velocity mode does not admit position or trajectory" do
+      payloads = Actuator.command_payloads(mode: :velocity)
+      refute Command.Position in payloads
+      refute Command.Trajectory in payloads
+    end
+  end
+
+  describe "Command.Stop" do
+    setup :armed_state
+
+    test "cuts torque and abandons the pending goal", %{
+      state: state,
+      servo_table: servo_table
+    } do
+      :ets.update_element(servo_table, 1, [{10, [goal_position: 3000]}])
+
+      BB.Process
+      |> expect(:call, fn TestRobot, :feetech, {:write, 1, :torque_enable, false} -> :ok end)
+
+      assert {:noreply, _state} =
+               Actuator.handle_command(%Message{payload: %Command.Stop{}}, state)
+
+      assert pending_writes(servo_table) == nil
+    end
+
+    test "decelerate stops the same way immediate does", %{state: state} do
+      BB.Process
+      |> stub(:call, fn TestRobot, :feetech, {:write, 1, :torque_enable, false} -> :ok end)
+
+      assert {:noreply, _state} =
+               Actuator.handle_command(
+                 %Message{payload: %Command.Stop{mode: :decelerate}},
+                 state
+               )
+    end
+
+    test "cancels a running trajectory", %{state: state} do
+      cmd = %Command.Trajectory{
+        waypoints: [
+          [position: 0.2, velocity: 1.0, acceleration: 0.0, time_from_start: 0],
+          [position: 0.4, velocity: 0.5, acceleration: 0.0, time_from_start: 500]
+        ]
+      }
+
+      {:noreply, state} = Actuator.handle_command(%Message{payload: cmd}, state)
+      assert state.trajectory != nil
+
+      BB.Process
+      |> stub(:call, fn TestRobot, :feetech, {:write, 1, :torque_enable, false} -> :ok end)
+
+      {:noreply, state} = Actuator.handle_command(%Message{payload: %Command.Stop{}}, state)
+
+      assert is_nil(state.trajectory)
+      assert is_nil(state.trajectory_timer)
+    end
+  end
+
+  describe "Command.Hold" do
+    test "does nothing to a powered servo in position mode", context do
+      %{state: state} = armed_state(context)
+
+      BB.Process
+      |> reject(:call, 3)
+
+      assert {:noreply, ^state} =
+               Actuator.handle_command(%Message{payload: %Command.Hold{}}, state)
+    end
+
+    test "commands a standstill in velocity mode", context do
+      %{state: state, servo_table: servo_table} = armed_state(context)
+      state = %{state | mode: :velocity}
+
+      assert {:noreply, _state} =
+               Actuator.handle_command(%Message{payload: %Command.Hold{}}, state)
+
+      assert goal(servo_table, :goal_speed) == 0.0
+    end
+
+    test "resumes a passive servo where it came to rest", context do
+      %{state: state} = passive_state(context)
+
+      BB.Process
+      |> expect(:call, fn TestRobot, :feetech, {:resume_servo, 1, [{:present_position, nil}]} ->
+        :ok
+      end)
+
+      assert {:noreply, _state} =
+               Actuator.handle_command(%Message{payload: %Command.Hold{}}, state)
+    end
+  end
+
+  describe "Command.Velocity" do
+    setup :armed_state
+
+    test "writes the goal speed", %{state: state, servo_table: servo_table} do
+      cmd = %Command.Velocity{velocity: 0.5}
+
+      assert {:noreply, _state} = Actuator.handle_command(%Message{payload: cmd}, state)
+      assert_in_delta goal(servo_table, :goal_speed), 0.5, 0.001
+    end
+
+    test "keeps the sign, because direction is the point", %{
+      state: state,
+      servo_table: servo_table
+    } do
+      cmd = %Command.Velocity{velocity: -0.5}
+
+      assert {:noreply, _state} = Actuator.handle_command(%Message{payload: cmd}, state)
+      assert_in_delta goal(servo_table, :goal_speed), -0.5, 0.001
+    end
+
+    test "clamps to the joint's velocity limit in both directions", %{
+      state: state,
+      servo_table: servo_table
+    } do
+      assert {:noreply, _state} =
+               Actuator.handle_command(
+                 %Message{payload: %Command.Velocity{velocity: 99.0}},
+                 state
+               )
+
+      assert_in_delta goal(servo_table, :goal_speed), @pi / 3, 0.001
+
+      assert {:noreply, _state} =
+               Actuator.handle_command(
+                 %Message{payload: %Command.Velocity{velocity: -99.0}},
+                 state
+               )
+
+      assert_in_delta goal(servo_table, :goal_speed), -@pi / 3, 0.001
+    end
+  end
+
+  describe "Command.Effort" do
+    setup :armed_state
+
+    test "writes a torque_limit fraction of the stall torque", %{
+      state: state,
+      servo_table: servo_table
+    } do
+      cmd = %Command.Effort{effort: 0.5}
+
+      assert {:noreply, _state} = Actuator.handle_command(%Message{payload: cmd}, state)
+      # 0.5 Nm against a 2.0 Nm stall torque is a quarter of what it can do.
+      assert_in_delta goal(servo_table, :torque_limit), 0.25, 0.001
+    end
+
+    test "a ceiling has no direction", %{state: state, servo_table: servo_table} do
+      cmd = %Command.Effort{effort: -0.5}
+
+      assert {:noreply, _state} = Actuator.handle_command(%Message{payload: cmd}, state)
+      assert_in_delta goal(servo_table, :torque_limit), 0.25, 0.001
+    end
+
+    test "asking for more than the servo has is asking for all of it", %{
+      state: state,
+      servo_table: servo_table
+    } do
+      cmd = %Command.Effort{effort: 99.0}
+
+      assert {:noreply, _state} = Actuator.handle_command(%Message{payload: cmd}, state)
+      assert_in_delta goal(servo_table, :torque_limit), 1.0, 0.001
+    end
+
+    test "clamps to the joint's effort limit when it has one", %{state: state} do
+      state = %{state | motor_profile: motor_profile(motor_effort_limit: 1.0)}
+      servo_table = state.servo_table
+
+      cmd = %Command.Effort{effort: 99.0}
+
+      assert {:noreply, _state} = Actuator.handle_command(%Message{payload: cmd}, state)
+      # Capped at the joint's 1.0 Nm rather than the servo's 2.0 Nm.
+      assert_in_delta goal(servo_table, :torque_limit), 0.5, 0.001
+    end
+
+    test "a ceiling alone doesn't move a passive joint, so a resume carries a standstill",
+         context do
+      %{state: state} = passive_state(context)
+
+      BB.Process
+      |> expect(:call, fn TestRobot, :feetech, {:resume_servo, 1, writes} ->
+        assert writes == [{:torque_limit, 0.25}, {:present_position, nil}]
+        :ok
+      end)
+
+      assert {:noreply, _state} =
+               Actuator.handle_command(%Message{payload: %Command.Effort{effort: 0.5}}, state)
+    end
+  end
+
+  describe "resuming a passive joint" do
+    setup :passive_state
+
+    test "a position command goes through the controller's ordered resume", %{state: state} do
+      BB.Process
+      |> expect(:call, fn TestRobot, :feetech, {:resume_servo, 1, writes} ->
+        assert Keyword.fetch!(writes, :goal_position) == 2048
+        :ok
+      end)
+
+      assert {:noreply, _state} =
+               Actuator.handle_command(%Message{payload: %Command.Position{position: 0.0}}, state)
+    end
+
+    test "the goal doesn't also land in the ETS table", %{
+      state: state,
+      servo_table: servo_table
+    } do
+      BB.Process
+      |> stub(:call, fn _robot, _controller, {:resume_servo, _, _} -> :ok end)
+
+      assert {:noreply, _state} =
+               Actuator.handle_command(%Message{payload: %Command.Position{position: 0.0}}, state)
+
+      assert pending_writes(servo_table) == nil
+    end
+
+    test "a failed resume stops the actuator", %{state: state} do
+      BB.Process
+      |> stub(:call, fn _robot, _controller, {:resume_servo, _, _} -> {:error, :timeout} end)
+
+      assert {:stop, :timeout, _state} =
+               Actuator.handle_command(%Message{payload: %Command.Position{position: 0.0}}, state)
+    end
+  end
+
+  describe "command expiry" do
+    setup :armed_state
+
+    test "a velocity command with a duration schedules an expiry", %{state: state} do
+      cmd = %Command.Velocity{velocity: 0.5, duration: 50}
+
+      assert {:noreply, state} = Actuator.handle_command(%Message{payload: cmd}, state)
+      assert is_reference(state.expiry_timer)
+
+      assert_receive {:expire_command, timer} when timer == state.expiry_timer, 500
+    end
+
+    test "expiring under :stop cuts torque", %{state: state} do
+      state = %{state | expiry_action: :stop, expiry_timer: timer = make_ref()}
+
+      BB.Process
+      |> expect(:call, fn TestRobot, :feetech, {:write, 1, :torque_enable, false} -> :ok end)
+
+      assert {:noreply, state} = Actuator.handle_info({:expire_command, timer}, state)
+      assert is_nil(state.expiry_timer)
+    end
+
+    test "expiring under :hold stays under power", %{state: state, servo_table: servo_table} do
+      state = %{
+        state
+        | expiry_action: :hold,
+          expiry_timer: timer = make_ref(),
+          mode: :velocity
+      }
+
+      assert {:noreply, _state} = Actuator.handle_info({:expire_command, timer}, state)
+      assert goal(servo_table, :goal_speed) == 0.0
+    end
+
+    test "a stale expiry doesn't cut a newer command short", %{state: state} do
+      state = %{state | expiry_timer: make_ref()}
+      stale = make_ref()
+
+      BB.Process
+      |> reject(:call, 3)
+
+      assert {:noreply, ^state} = Actuator.handle_info({:expire_command, stale}, state)
+    end
+
+    test "a new command cancels the previous expiry", %{state: state} do
+      state = %{state | expiry_timer: make_ref()}
+
+      assert {:noreply, state} =
+               Actuator.handle_command(%Message{payload: %Command.Position{position: 0.0}}, state)
+
+      assert is_nil(state.expiry_timer)
+    end
+  end
+
   # --- Test helpers ---
 
-  defp armed_state(_context) do
+  defp base_opts(overrides \\ []) do
+    Keyword.merge(
+      [
+        bb: %{robot: TestRobot, path: [:shoulder, :servo]},
+        servo_id: 1,
+        controller: :feetech,
+        motor_profile: motor_profile()
+      ],
+      overrides
+    )
+  end
+
+  defp drain_messages(acc \\ []) do
+    receive do
+      message -> drain_messages([message | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
+  end
+
+  defp armed_state(context), do: powered_state(context, true)
+
+  defp passive_state(context), do: powered_state(context, false)
+
+  defp powered_state(_context, torque_enabled) do
     servo_table = :ets.new(:test_servo_table, [:set, :public])
 
     :ets.insert(
       servo_table,
-      {1, [:shoulder, :servo], 2, nil, nil, nil, nil, nil, nil, nil, nil}
+      {1, [:shoulder, :servo], 2, nil, nil, nil, nil, nil, nil, nil, torque_enabled}
     )
 
     state = %State{
@@ -595,10 +1020,12 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       controller: :feetech,
       current_motor_angle: 0.0,
       joint_name: :shoulder,
+      mode: :position,
       motor_profile: motor_profile(),
       name: :servo,
       servo_id: 1,
-      servo_table: servo_table
+      servo_table: servo_table,
+      stall_torque: 2.0
     }
 
     BB.Actuator
@@ -610,4 +1037,11 @@ defmodule BB.Servo.Feetech.ActuatorTest do
 
     %{state: state, servo_table: servo_table}
   end
+
+  defp pending_writes(servo_table) do
+    [{1, _, _, _, _, _, _, _, _, pending_writes, _}] = :ets.lookup(servo_table, 1)
+    pending_writes
+  end
+
+  defp goal(servo_table, param), do: Keyword.fetch!(pending_writes(servo_table), param)
 end
