@@ -101,6 +101,8 @@ defmodule BB.Servo.Feetech.Actuator do
         actuator :servo, {BB.Servo.Feetech.Actuator, servo_id: 1, controller: :feetech}
       end
   """
+  import BB.Unit.Option
+
   use BB.Actuator,
     options_schema: [
       servo_id: [
@@ -129,11 +131,11 @@ defmodule BB.Servo.Feetech.Actuator do
         default: :position
       ],
       stall_torque: [
-        type: {:or, [nil, :float]},
+        type: {:or, [nil, unit_type(compatible: :newton_meter)]},
         doc: """
-        The servo's rated stall torque in newton metres, used to scale
-        `Command.Effort` into a `torque_limit` ceiling. Defaults to the figure
-        in `BB.Servo.Feetech.Model` for the model the servo reports. Set it
+        The servo's rated stall torque, used to scale `Command.Effort` into a
+        `torque_limit` ceiling. Defaults to the figure in
+        `BB.Servo.Feetech.Model` for the model the servo reports. Set it
         yourself if the servo isn't recognised, or if it is an STS3215 variant
         other than the 7.4V 1:345 — they all report the same model number.
         """,
@@ -156,6 +158,7 @@ defmodule BB.Servo.Feetech.Actuator do
   alias BB.Message
   alias BB.Message.Actuator.Command
   alias BB.Process, as: BBProcess
+  alias BB.Robot.Units
   alias BB.Servo.Feetech.Model
 
   defmodule State do
@@ -247,7 +250,7 @@ defmodule BB.Servo.Feetech.Actuator do
         name: name,
         position_deadband: Map.get(opts, :position_deadband, 2),
         servo_id: opts.servo_id,
-        stall_torque: Map.get(opts, :stall_torque)
+        stall_torque: newton_metres(Map.get(opts, :stall_torque))
       }
 
       {:ok, state}
@@ -762,6 +765,14 @@ defmodule BB.Servo.Feetech.Actuator do
     motor_angle
     |> max(lower)
     |> min(upper)
+  end
+
+  defp newton_metres(nil), do: nil
+
+  defp newton_metres(unit) do
+    unit
+    |> Localize.Unit.convert!(BB.Unit.unit_name(:newton_meter))
+    |> Units.extract_float()
   end
 
   # Velocity limits are magnitudes; the joint may travel either way.

@@ -6,6 +6,8 @@ defmodule BB.Servo.Feetech.ActuatorTest do
   use ExUnit.Case, async: false
   use Mimic
 
+  import BB.Unit
+
   alias BB.Actuator.MotorProfile
   alias BB.Message
   alias BB.Message.Actuator.Command
@@ -156,7 +158,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
     end
 
     test "prefers a configured stall torque over the model's" do
-      assert {:ok, state} = Actuator.init(base_opts(stall_torque: 3.5))
+      assert {:ok, state} = Actuator.init(base_opts(stall_torque: ~u(3.5 newton_meter)))
       assert_in_delta state.stall_torque, 3.5, 0.001
     end
 
@@ -183,7 +185,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
         end
       end)
 
-      assert {:ok, state} = Actuator.init(base_opts(stall_torque: 3.5))
+      assert {:ok, state} = Actuator.init(base_opts(stall_torque: ~u(3.5 newton_meter)))
       assert_in_delta state.stall_torque, 3.5, 0.001
     end
 

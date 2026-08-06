@@ -102,7 +102,7 @@ Actuator (`{BB.Servo.Feetech.Actuator, opts}`):
 | `:controller` | required | Name of the controller entry in the DSL |
 | `:position_deadband` | `2` | Min raw-unit change before publishing feedback |
 | `:mode` | `:position` | Operating mode; also `:velocity` |
-| `:stall_torque` | from the model | Rated stall torque in Nm, for scaling `Effort` |
+| `:stall_torque` | from the model | Rated stall torque, e.g. `~u(19.5 kilogram_force_centimeter)` |
 | `:expiry_action` | `:stop` | `:hold` to stay under power when a `duration` runs out |
 
 Position and velocity limits come from the joint's `limit` block, not actuator

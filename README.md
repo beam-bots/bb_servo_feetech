@@ -253,7 +253,7 @@ bus. Define one controller per serial adapter. The controller handles:
 | `controller` | atom | required | Name of the controller in robot registry |
 | `position_deadband` | integer | 2 | Minimum position change (raw units) to publish feedback |
 | `mode` | `:position` \| `:velocity` | `:position` | Operating mode, fixed at startup |
-| `stall_torque` | float \| nil | from the model | Rated stall torque (Nm), for scaling effort |
+| `stall_torque` | `~u()` torque \| nil | from the model | Rated stall torque, for scaling effort |
 | `expiry_action` | `:stop` \| `:hold` | `:stop` | What to do when a command's `duration` runs out |
 
 Configure direction reversal on the joint transmission, not as an actuator
