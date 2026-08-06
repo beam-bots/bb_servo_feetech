@@ -56,6 +56,17 @@ Bridge (GenServer) --reads/writes--> Controller --reads/writes--> Servo register
   and torque management. Multiple actuators share one controller. Implements the `BB.Controller`
   behaviour, including its `disarm/1` safety callback.
 
+  Every write to `torque_enable` goes through the controller, so it caches each servo's torque
+  state in the ETS row. That lets an actuator tell whether its goal will be acted on without a
+  bus round trip. `{:resume_servo, id, writes}` is the ordered way back under power: the goals
+  are written and acknowledged *before* torque comes on, so a servo that has drifted while
+  passive doesn't lunge for the goal it was chasing when torque was cut.
+
+  Pending writes are `{param, value}` pairs grouped by param each tick, so one `sync_write`
+  covers every servo that wanted that register. Values are in the units `Feetech.write/5` takes
+  — except `goal_position`, which is raw encoder units because this driver puts motor zero at
+  the encoder midpoint rather than at the control table's signed zero.
+
 - **Actuator** (`lib/bb/servo/feetech/actuator.ex`) - GenServer that receives position commands
   (radians), converts to servo position (0-4095), writes `goal_position`/`goal_speed` to the
   controller's ETS command table, and publishes `BB.Message.Actuator.BeginMotion` messages. Accepts commands sent via:
@@ -65,6 +76,31 @@ Bridge (GenServer) --reads/writes--> Controller --reads/writes--> Servo register
 
   All three arrive at `handle_command/2`; `BB.Actuator.Server` checks arm state and applies
   the joint's transmission before the driver sees them.
+
+  It also handles `Command.Stop` (cut torque, joint goes passive) and `Command.Hold` (re-apply
+  torque where the joint is now resting; a no-op if it never went passive). Any command to a
+  joint left passive by a `Stop` resumes on the way past, so callers needn't pair the two.
+
+  `:mode` fixes the servo's operating mode at startup and decides what `command_payloads/1`
+  declares — `:position` or `:velocity`. Anything outside the mode's list is refused by the
+  framework with `BB.Error.State.UnsupportedCommand`. The mode register is EEPROM, so it is
+  written once with torque already off and the `lock` register cleared, and only when the servo
+  isn't already in the right mode. The servo's `:pwm` and `:step` modes aren't offered.
+
+  The joint's `motor_acceleration_limit` is written to the servo's `acceleration`
+  register once at startup, and again if a parameter change alters the profile. A joint
+  declaring no acceleration limit gets `0`, the servo's "no limit" — which is what
+  `BB.Sim.Actuator` assumes when it falls back to a rectangular velocity profile.
+
+  `Command.Effort` is a **ceiling, not a goal** — these servos have no torque goal register.
+  It writes `torque_limit` as a fraction of the model's rated stall torque (see **Model**), so
+  setting one won't move anything on its own.
+
+- **Model** (`lib/bb/servo/feetech/model.ex`) - Rated stall torque per model number, used to
+  scale `Command.Effort` into a `torque_limit` fraction. Rougher than the Robotis equivalent:
+  an STS3215 reports 777 whether it is a 19.5, 27.4 or 30 kgf·cm variant, so the table carries
+  the most common one and `:stall_torque` on the actuator overrides it. An unrecognised model
+  refuses to start unless `:stall_torque` is set.
 
 - **Bridge** (`lib/bb/servo/feetech/bridge.ex`) - Parameter bridge exposing servo control table
   parameters through the BB parameter system. Parameters are identified as `"servo_id:param_name"`.
@@ -107,7 +143,22 @@ BB.Actuator.set_position!(MyRobot, :servo, 0.5)
 
 # Synchronous delivery (with acknowledgement)
 {:ok, :accepted} = BB.Actuator.set_position_sync(MyRobot, :servo, 0.5)
+
+# Go passive — the joint can be backdriven by hand, and will sag under load
+BB.Actuator.stop(MyRobot, :servo)
+
+# Back under power, holding wherever it came to rest
+BB.Actuator.hold(MyRobot, :servo)
+
+# Only in an actuator configured `mode: :velocity`
+BB.Actuator.set_velocity(MyRobot, :wheel, 2.0, duration: 500)
+
+# A ceiling on what a move may draw, not a goal — moves nothing on its own
+BB.Actuator.set_effort(MyRobot, :gripper, 0.4)
 ```
+
+`stop/3` is not the safety path: it leaves the robot armed and commandable. Making the
+hardware safe is `MyRobot.disarm()`, which is robot-wide.
 
 ### Integration Pattern
 
@@ -216,6 +267,10 @@ Controller reports hardware errors to BB.Safety
 | Current sensing | `present_current` | `present_load` (percentage) |
 | Error bit 4 | Error flag | Torque enabled state |
 | Default voltage | 10-14V | 5.5-8V |
+| Operating modes | position, velocity, current, current-position | position, velocity (also pwm/step, not offered) |
+| Effort | `goal_current`, a torque goal via the model's Nm/A constant | `torque_limit`, a ceiling as a fraction of rated stall torque |
+| Mode register | RAM-adjacent; resets PID gains when written | EEPROM; needs `lock` cleared and has a finite write budget |
+| Model number | Identifies the servo and its capabilities | Identifies the family only — 777 spans three torque ratings |
 
 ## Licensing headers
 
