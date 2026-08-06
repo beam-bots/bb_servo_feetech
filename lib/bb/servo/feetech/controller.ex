@@ -271,12 +271,12 @@ defmodule BB.Servo.Feetech.Controller do
   end
 
   def handle_call({:write, servo_id, param, value}, _from, state) do
-    result = Feetech.write(state.feetech, servo_id, param, value, await: true)
+    result = Feetech.write(state.feetech, servo_id, param, value, await_response: true)
     {:reply, result, state}
   end
 
   def handle_call({:write_raw, servo_id, param, value}, _from, state) do
-    result = Feetech.write_raw(state.feetech, servo_id, param, value, await: true)
+    result = Feetech.write_raw(state.feetech, servo_id, param, value, await_response: true)
     {:reply, result, state}
   end
 

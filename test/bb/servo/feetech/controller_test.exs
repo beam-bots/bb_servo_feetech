@@ -286,7 +286,7 @@ defmodule BB.Servo.Feetech.ControllerTest do
 
     test "forwards write to Feetech with await", %{state: state} do
       Feetech
-      |> expect(:write, fn pid, 1, :torque_enable, true, [await: true] when is_pid(pid) ->
+      |> expect(:write, fn pid, 1, :torque_enable, true, [await_response: true] when is_pid(pid) ->
         :ok
       end)
 
@@ -296,7 +296,7 @@ defmodule BB.Servo.Feetech.ControllerTest do
 
     test "forwards write_raw to Feetech with await", %{state: state} do
       Feetech
-      |> expect(:write_raw, fn pid, 1, :goal_position, 2048, [await: true] when is_pid(pid) ->
+      |> expect(:write_raw, fn pid, 1, :goal_position, 2048, [await_response: true] when is_pid(pid) ->
         :ok
       end)
 
