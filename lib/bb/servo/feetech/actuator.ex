@@ -182,8 +182,9 @@ defmodule BB.Servo.Feetech.Actuator do
   @position_resolution 4096
   @position_center 2048
 
-  # ETS tuple field index for command writes
+  # ETS tuple field indices for command writes
   @ets_idx_pending_writes 10
+  @ets_idx_pending_limit 11
 
   @doc """
   Safety disarm callback.
@@ -398,20 +399,16 @@ defmodule BB.Servo.Feetech.Actuator do
   # velocity mode there is no position to return to — holding is commanding a
   # standstill, which a powered servo resists being moved from.
   def handle_command(%Message{payload: %Command.Hold{}}, state) do
-    state = cancel_trajectory(cancel_expiry(state))
-
-    cond do
-      not torque_enabled?(state) -> reply(state, resume(state, hold_write(state)))
-      state.mode == :velocity -> apply_and_reply(state, hold_write(state))
-      true -> {:noreply, state}
-    end
+    state
+    |> cancel_expiry()
+    |> cancel_trajectory()
+    |> do_hold()
   end
 
   def handle_command(%Message{payload: %Command.Velocity{} = cmd}, state) do
     velocity = clamp(cmd.velocity, state.motor_profile.motor_velocity_limit)
 
     state
-    |> cancel_trajectory()
     |> schedule_expiry(cmd.duration)
     |> apply_and_reply([{:goal_speed, velocity}])
   end
@@ -421,9 +418,19 @@ defmodule BB.Servo.Feetech.Actuator do
   # which is how you get a gripper that squeezes to a limit rather than to a
   # position. Setting it will not, on its own, make the joint move.
   def handle_command(%Message{payload: %Command.Effort{} = cmd}, state) do
-    state
-    |> schedule_expiry(cmd.duration)
-    |> apply_and_reply([{:torque_limit, effort_to_fraction(cmd.effort, state)}])
+    state = schedule_expiry(state, cmd.duration)
+    fraction = effort_to_fraction(cmd.effort, state)
+
+    # A ceiling outlives the move it was set for, so it gets its own slot rather
+    # than sharing the one a motion command replaces wholesale. On the resume
+    # path it travels with the goal, because torque has to come back on and the
+    # ceiling must be in place before the servo starts pulling against it.
+    if torque_enabled?(state) do
+      write_torque_limit(state, fraction)
+      {:noreply, state}
+    else
+      reply(state, resume(state, [{:torque_limit, fraction}]))
+    end
   end
 
   @impl BB.Actuator
@@ -438,11 +445,23 @@ defmodule BB.Servo.Feetech.Actuator do
 
     case state.expiry_action do
       :stop -> reply(state, stop_driving(state))
-      :hold -> apply_and_reply(state, hold_write(state))
+      :hold -> do_hold(state)
     end
   end
 
   def handle_info(_message, state), do: {:noreply, state}
+
+  # A powered servo in position mode is already holding whatever it was last
+  # told, so there is nothing to write. The `:present_position` sentinel is only
+  # meaningful on the resume path, where the controller resolves it against the
+  # bus — writing it as a goal would be a write to a read-only register.
+  defp do_hold(state) do
+    cond do
+      not torque_enabled?(state) -> reply(state, resume(state, hold_write(state)))
+      state.mode == :velocity -> apply_and_reply(state, hold_write(state))
+      true -> {:noreply, state}
+    end
+  end
 
   # --- Applying writes ---
 
@@ -513,11 +532,9 @@ defmodule BB.Servo.Feetech.Actuator do
   # rather than cutting the new command short.
   defp cancel_expiry(state), do: %{state | expiry_timer: nil}
 
-  defp torque_enabled?(%{servo_table: nil}), do: false
-
   defp torque_enabled?(state) do
     case :ets.lookup(state.servo_table, state.servo_id) do
-      [{_, _, _, _, _, _, _, _, _, _, torque_enabled}] -> torque_enabled == true
+      [{_, _, _, _, _, _, _, _, _, _, _, torque_enabled}] -> torque_enabled == true
       [] -> false
     end
   rescue
@@ -583,13 +600,22 @@ defmodule BB.Servo.Feetech.Actuator do
   defp compute_goal_speed(_cmd, _clamped_angle, state),
     do: state.motor_profile.motor_velocity_limit
 
-  defp clear_pending_writes(state), do: write_servo_command(state, nil)
+  defp clear_pending_writes(state) do
+    update_row(state, [{@ets_idx_pending_writes, nil}, {@ets_idx_pending_limit, nil}])
+  end
 
   defp write_servo_command(state, pending_writes) do
-    :ets.update_element(state.servo_table, state.servo_id, [
-      {@ets_idx_pending_writes, pending_writes}
-    ])
+    update_row(state, [{@ets_idx_pending_writes, pending_writes}])
+  end
+
+  defp write_torque_limit(state, fraction) do
+    update_row(state, [{@ets_idx_pending_limit, fraction}])
+  end
+
+  defp update_row(state, elements) do
+    :ets.update_element(state.servo_table, state.servo_id, elements)
   rescue
+    # The controller owns the table; if it has gone, so has the bus.
     ArgumentError -> false
   end
 

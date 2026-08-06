@@ -845,14 +845,14 @@ defmodule BB.Servo.Feetech.ActuatorTest do
 
       assert {:noreply, _state} = Actuator.handle_command(%Message{payload: cmd}, state)
       # 0.5 Nm against a 2.0 Nm stall torque is a quarter of what it can do.
-      assert_in_delta goal(servo_table, :torque_limit), 0.25, 0.001
+      assert_in_delta torque_limit(servo_table), 0.25, 0.001
     end
 
     test "a ceiling has no direction", %{state: state, servo_table: servo_table} do
       cmd = %Command.Effort{effort: -0.5}
 
       assert {:noreply, _state} = Actuator.handle_command(%Message{payload: cmd}, state)
-      assert_in_delta goal(servo_table, :torque_limit), 0.25, 0.001
+      assert_in_delta torque_limit(servo_table), 0.25, 0.001
     end
 
     test "asking for more than the servo has is asking for all of it", %{
@@ -862,7 +862,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       cmd = %Command.Effort{effort: 99.0}
 
       assert {:noreply, _state} = Actuator.handle_command(%Message{payload: cmd}, state)
-      assert_in_delta goal(servo_table, :torque_limit), 1.0, 0.001
+      assert_in_delta torque_limit(servo_table), 1.0, 0.001
     end
 
     test "clamps to the joint's effort limit when it has one", %{state: state} do
@@ -873,7 +873,22 @@ defmodule BB.Servo.Feetech.ActuatorTest do
 
       assert {:noreply, _state} = Actuator.handle_command(%Message{payload: cmd}, state)
       # Capped at the joint's 1.0 Nm rather than the servo's 2.0 Nm.
-      assert_in_delta goal(servo_table, :torque_limit), 0.5, 0.001
+      assert_in_delta torque_limit(servo_table), 0.5, 0.001
+    end
+
+    test "survives a motion command arriving in the same tick", %{
+      state: state,
+      servo_table: servo_table
+    } do
+      assert {:noreply, state} =
+               Actuator.handle_command(%Message{payload: %Command.Effort{effort: 0.5}}, state)
+
+      assert {:noreply, _state} =
+               Actuator.handle_command(%Message{payload: %Command.Position{position: 0.5}}, state)
+
+      # The move replaces the goal, but the ceiling is not a goal.
+      assert_in_delta torque_limit(servo_table), 0.25, 0.001
+      assert Keyword.has_key?(pending_writes(servo_table), :goal_position)
     end
 
     test "a ceiling alone doesn't move a passive joint, so a resume carries a standstill",
@@ -950,15 +965,26 @@ defmodule BB.Servo.Feetech.ActuatorTest do
     end
 
     test "expiring under :hold stays under power", %{state: state, servo_table: servo_table} do
-      state = %{
-        state
-        | expiry_action: :hold,
-          expiry_timer: timer = make_ref(),
-          mode: :velocity
-      }
+      timer = make_ref()
+      state = %{state | expiry_action: :hold, expiry_timer: timer, mode: :velocity}
 
       assert {:noreply, _state} = Actuator.handle_info({:expire_command, timer}, state)
       assert goal(servo_table, :goal_speed) == 0.0
+    end
+
+    test "expiring under :hold writes nothing in position mode", %{
+      state: state,
+      servo_table: servo_table
+    } do
+      timer = make_ref()
+      state = %{state | expiry_action: :hold, expiry_timer: timer}
+
+      assert {:noreply, _state} = Actuator.handle_info({:expire_command, timer}, state)
+
+      # A powered servo already holds its goal. The `:present_position` sentinel
+      # is only resolvable on the resume path — writing it here would send a
+      # nil to a read-only register.
+      assert pending_writes(servo_table) == nil
     end
 
     test "a stale expiry doesn't cut a newer command short", %{state: state} do
@@ -1012,7 +1038,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
 
     :ets.insert(
       servo_table,
-      {1, [:shoulder, :servo], 2, nil, nil, nil, nil, nil, nil, nil, torque_enabled}
+      {1, [:shoulder, :servo], 2, nil, nil, nil, nil, nil, nil, nil, nil, torque_enabled}
     )
 
     state = %State{
@@ -1039,9 +1065,14 @@ defmodule BB.Servo.Feetech.ActuatorTest do
   end
 
   defp pending_writes(servo_table) do
-    [{1, _, _, _, _, _, _, _, _, pending_writes, _}] = :ets.lookup(servo_table, 1)
+    [{1, _, _, _, _, _, _, _, _, pending_writes, _, _}] = :ets.lookup(servo_table, 1)
     pending_writes
   end
 
   defp goal(servo_table, param), do: Keyword.fetch!(pending_writes(servo_table), param)
+
+  defp torque_limit(servo_table) do
+    [{1, _, _, _, _, _, _, _, _, _, pending_limit, _}] = :ets.lookup(servo_table, 1)
+    pending_limit
+  end
 end

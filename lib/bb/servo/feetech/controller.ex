@@ -51,14 +51,20 @@ defmodule BB.Servo.Feetech.Controller do
       {servo_id, actuator_path, position_deadband,
        last_position_raw, present_position, present_temperature,
        present_voltage, present_load, hardware_error,
-       pending_writes, torque_enabled}
+       pending_writes, pending_limit, torque_enabled}
 
-  Actuators write `pending_writes` — a list of `{param, raw_value}` pairs naming
+  Actuators write `pending_writes` — a list of `{param, value}` pairs naming
   whichever goal registers their operating mode acts on — via
   `:ets.update_element/3`. The controller groups them by param each tick so a
   position move's `goal_position` and `goal_speed` still leave as one
   `sync_write` each, then clears them. It uses `BB.Actuator.to_joint_space/3` to
   translate encoder readings to joint-space before publishing `JointState`.
+
+  `pending_limit` is the torque ceiling, and has a slot of its own because it
+  isn't a goal. A new motion command supersedes the last one, so `pending_writes`
+  is replaced wholesale; a ceiling outlives the move it was set for, and would be
+  lost if an `Effort` and a `Position` arriving in the same tick had to share a
+  slot.
 
   ## Torque state
 
@@ -134,7 +140,8 @@ defmodule BB.Servo.Feetech.Controller do
   @idx_present_load 8
   @idx_hardware_error 9
   @idx_pending_writes 10
-  @idx_torque_enabled 11
+  @idx_pending_limit 11
+  @idx_torque_enabled 12
 
   # Diagnostic thresholds (Feetech servos typically run on 6-7.4V)
   @temp_warning_threshold 55.0
@@ -257,6 +264,7 @@ defmodule BB.Servo.Feetech.Controller do
       _present_load = nil,
       _hardware_error = nil,
       _pending_writes = nil,
+      _pending_limit = nil,
       # The actuator disables torque before it registers.
       _torque_enabled = false
     })
@@ -374,20 +382,29 @@ defmodule BB.Servo.Feetech.Controller do
     entries = :ets.tab2list(state.servo_table)
 
     commands =
-      for {id, _, _, _, _, _, _, _, _, pending_writes, _} <- entries,
-          pending_writes != nil,
-          do: {id, pending_writes}
+      for {id, _, _, _, _, _, _, _, _, pending_writes, pending_limit, _} <- entries,
+          writes = pending_command(pending_writes, pending_limit),
+          do: {id, writes}
 
     if commands != [] do
       write_by_param(state, commands)
 
       for {id, _} <- commands do
-        :ets.update_element(state.servo_table, id, [{@idx_pending_writes, nil}])
+        :ets.update_element(
+          state.servo_table,
+          id,
+          [{@idx_pending_writes, nil}, {@idx_pending_limit, nil}]
+        )
       end
     end
 
     state
   end
+
+  defp pending_command(nil, nil), do: nil
+  defp pending_command(nil, limit), do: [{:torque_limit, limit}]
+  defp pending_command(writes, nil), do: writes
+  defp pending_command(writes, limit), do: [{:torque_limit, limit} | writes]
 
   # Batching is the whole point of this loop: whatever mix of goal registers the
   # actuators asked for, each one leaves as a single `sync_write` covering every
@@ -470,7 +487,7 @@ defmodule BB.Servo.Feetech.Controller do
   defp maybe_publish_position(state, servo_id, position_rad) do
     case :ets.lookup(state.servo_table, servo_id) do
       [
-        {^servo_id, actuator_path, position_deadband, last_position_raw, _, _, _, _, _, _, _}
+        {^servo_id, actuator_path, position_deadband, last_position_raw, _, _, _, _, _, _, _, _}
       ] ->
         if should_publish_position?(position_rad, last_position_raw, position_deadband) do
           # The Feetech servo reads back an absolute position in [0, 2π) radians,
@@ -728,7 +745,7 @@ defmodule BB.Servo.Feetech.Controller do
 
   defp get_joint_name(state, servo_id) do
     case :ets.lookup(state.servo_table, servo_id) do
-      [{^servo_id, actuator_path, _, _, _, _, _, _, _, _, _}] ->
+      [{^servo_id, actuator_path, _, _, _, _, _, _, _, _, _, _}] ->
         joint_name_from_path(actuator_path)
 
       [] ->

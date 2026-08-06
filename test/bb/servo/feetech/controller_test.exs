@@ -223,7 +223,7 @@ defmodule BB.Servo.Feetech.ControllerTest do
 
       [
         {1, actuator_path, deadband, last_pos, present_pos, present_temp, present_voltage,
-         present_load, hw_error, pending_writes, torque_enabled}
+         present_load, hw_error, pending_writes, pending_limit, torque_enabled}
       ] =
         :ets.lookup(state.servo_table, 1)
 
@@ -236,6 +236,7 @@ defmodule BB.Servo.Feetech.ControllerTest do
       assert present_load == nil
       assert hw_error == nil
       assert pending_writes == nil
+      assert pending_limit == nil
       assert torque_enabled == false
     end
 
@@ -250,10 +251,10 @@ defmodule BB.Servo.Feetech.ControllerTest do
 
       assert new_state.servo_ids == [1, 2]
 
-      [{1, [:shoulder, :servo], _, _, _, _, _, _, _, _, _}] =
+      [{1, [:shoulder, :servo], _, _, _, _, _, _, _, _, _, _}] =
         :ets.lookup(state.servo_table, 1)
 
-      [{2, [:elbow, :servo], _, _, _, _, _, _, _, _, _}] = :ets.lookup(state.servo_table, 2)
+      [{2, [:elbow, :servo], _, _, _, _, _, _, _, _, _, _}] = :ets.lookup(state.servo_table, 2)
     end
   end
 
@@ -323,7 +324,7 @@ defmodule BB.Servo.Feetech.ControllerTest do
       state: state,
       servo_table: servo_table
     } do
-      :ets.update_element(servo_table, 1, [{11, true}])
+      :ets.update_element(servo_table, 1, [{12, true}])
 
       Feetech
       |> expect(:write_raw, fn _pid, 1, :torque_enable, 0, _opts -> :ok end)
@@ -397,7 +398,7 @@ defmodule BB.Servo.Feetech.ControllerTest do
       message = {:resume_servo, 1, [{:goal_position, 2048}]}
       assert {:reply, :ok, _state} = Controller.handle_call(message, {self(), make_ref()}, state)
 
-      [{1, _, _, _, _, _, _, _, _, pending_writes, _}] = :ets.lookup(servo_table, 1)
+      [{1, _, _, _, _, _, _, _, _, pending_writes, _, _}] = :ets.lookup(servo_table, 1)
       assert pending_writes == nil
       assert torque_enabled?(servo_table, 1)
     end
@@ -434,12 +435,12 @@ defmodule BB.Servo.Feetech.ControllerTest do
 
       :ets.insert(
         base.servo_table,
-        {1, [:shoulder, :servo], 2, nil, nil, nil, nil, nil, nil, nil, false}
+        {1, [:shoulder, :servo], 2, nil, nil, nil, nil, nil, nil, nil, nil, false}
       )
 
       :ets.insert(
         base.servo_table,
-        {2, [:elbow, :servo], 2, nil, nil, nil, nil, nil, nil, nil, false}
+        {2, [:elbow, :servo], 2, nil, nil, nil, nil, nil, nil, nil, nil, false}
       )
 
       state = %{base.state | servo_ids: [1, 2]}
@@ -508,7 +509,7 @@ defmodule BB.Servo.Feetech.ControllerTest do
 
       assert {:noreply, _state} = Controller.handle_info(:tick, state)
 
-      [{1, _, _, _, _, _, _, _, _, pending_writes, _}] =
+      [{1, _, _, _, _, _, _, _, _, pending_writes, _, _}] =
         :ets.lookup(state.servo_table, 1)
 
       assert pending_writes == nil
@@ -516,7 +517,8 @@ defmodule BB.Servo.Feetech.ControllerTest do
 
     test "writes the torque ceiling before the goal that might reach it", %{state: state} do
       :ets.update_element(state.servo_table, 1, [
-        {10, [goal_position: 2048, torque_limit: 0.25]}
+        {10, [goal_position: 2048]},
+        {11, 0.25}
       ])
 
       test_pid = self()
@@ -587,7 +589,7 @@ defmodule BB.Servo.Feetech.ControllerTest do
 
       assert {:noreply, _state} = Controller.handle_info(:tick, state)
 
-      [{1, _, _, last_pos, present_pos, _, _, _, _, _, _}] =
+      [{1, _, _, last_pos, present_pos, _, _, _, _, _, _, _}] =
         :ets.lookup(state.servo_table, 1)
 
       assert last_pos == 3.14
@@ -695,12 +697,12 @@ defmodule BB.Servo.Feetech.ControllerTest do
 
     :ets.insert(
       base.servo_table,
-      {1, [:shoulder, :servo], 2, nil, nil, nil, nil, nil, nil, nil, false}
+      {1, [:shoulder, :servo], 2, nil, nil, nil, nil, nil, nil, nil, nil, false}
     )
 
     :ets.insert(
       base.servo_table,
-      {2, [:elbow, :servo], 2, nil, nil, nil, nil, nil, nil, nil, false}
+      {2, [:elbow, :servo], 2, nil, nil, nil, nil, nil, nil, nil, nil, false}
     )
 
     BB.Actuator
@@ -712,7 +714,7 @@ defmodule BB.Servo.Feetech.ControllerTest do
   end
 
   defp torque_enabled?(servo_table, servo_id) do
-    [{^servo_id, _, _, _, _, _, _, _, _, _, torque_enabled}] =
+    [{^servo_id, _, _, _, _, _, _, _, _, _, _, torque_enabled}] =
       :ets.lookup(servo_table, servo_id)
 
     torque_enabled
