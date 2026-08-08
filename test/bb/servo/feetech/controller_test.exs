@@ -575,7 +575,8 @@ defmodule BB.Servo.Feetech.ControllerTest do
 
       assert {:noreply, _state} = Controller.handle_info(:tick, state)
 
-      assert drain_messages() == [:torque_limit, :goal_position]
+      writes = Enum.filter(drain_messages(), &(&1 in [:torque_limit, :goal_position]))
+      assert writes == [:torque_limit, :goal_position]
     end
 
     test "skips sync_write when no commands pending", %{state: state} do

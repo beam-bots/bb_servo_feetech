@@ -189,19 +189,24 @@ defmodule BB.Servo.Feetech.Actuator do
 
   @radians_per_step 2 * :math.pi() / @position_resolution
 
-  # What the registers can express, in motor space. The encoder spans one
-  # revolution with motor zero at its midpoint, and the speed register counts
-  # those same steps per second. A joint declared outside these bounds cannot be
-  # driven as declared, so `init/1` refuses it rather than quietly writing
-  # something else — see `validate_motor_profile/2`.
+  # The documented ranges, in motor space: the encoder spans one revolution with
+  # motor zero at its midpoint, and the speed register counts those same steps
+  # per second.
+  #
+  # The registers themselves are wider than this and will store whatever fits —
+  # an STS3215 accepts a goal position of 5000 and a goal speed of 32767 without
+  # complaint. What it *does* with them is undefined, and a value interpreted
+  # modulo the documented range would come out as an unexpectedly small one, so
+  # `init/1` refuses rather than gambling on it.
   @min_motor_angle -@position_center * @radians_per_step
   @max_motor_angle (@position_resolution - 1 - @position_center) * @radians_per_step
   @max_motor_speed (@position_resolution - 1) * @radians_per_step
 
   # `acceleration` is a single byte counting hundreds of steps per second
-  # squared, so it is coarse as well as bounded.
+  # squared, so it is coarse. Its ceiling is not stated here because firmware
+  # disagrees with the datasheet about what it is — `write_acceleration/1` reads
+  # the register back and takes the servo's word for it.
   @radians_per_acceleration_unit 100 * @radians_per_step
-  @max_motor_acceleration 254 * @radians_per_acceleration_unit
 
   # ETS tuple field indices for command writes
   @ets_idx_pending_writes 10
@@ -319,7 +324,7 @@ defmodule BB.Servo.Feetech.Actuator do
        value: lower,
        message:
          "Joint reaches #{degrees(lower)} in motor space, below the " <>
-           "#{degrees(@min_motor_angle)} the servo's encoder can address"
+           "#{degrees(@min_motor_angle)} the servo's encoder addresses"
      }}
   end
 
@@ -332,7 +337,7 @@ defmodule BB.Servo.Feetech.Actuator do
        value: upper,
        message:
          "Joint reaches #{degrees(upper)} in motor space, beyond the " <>
-           "#{degrees(@max_motor_angle)} the servo's encoder can address"
+           "#{degrees(@max_motor_angle)} the servo's encoder addresses"
      }}
   end
 
@@ -346,25 +351,7 @@ defmodule BB.Servo.Feetech.Actuator do
        message:
          "Joint is declared at #{degrees(velocity)}/s in motor space, faster " <>
            "than the #{degrees(@max_motor_speed)}/s the servo's goal_speed " <>
-           "register can express"
-     }}
-  end
-
-  # Acceleration is optional — `nil` means the joint declares no limit, which
-  # the register expresses as 0. A guard on `is_number/1` rather than an earlier
-  # `nil` clause, because in Erlang term order an atom sorts above every number
-  # and `nil > @max_motor_acceleration` would otherwise be true.
-  defp validate_motor_profile(%{motor_acceleration_limit: acceleration}, joint_name)
-       when is_number(acceleration) and acceleration > @max_motor_acceleration do
-    {:error,
-     %JointConfigError{
-       joint: joint_name,
-       field: :acceleration,
-       value: acceleration,
-       message:
-         "Joint is declared at #{degrees(acceleration)}/s² in motor space, " <>
-           "beyond the #{degrees(@max_motor_acceleration)}/s² the servo's " <>
-           "acceleration register can express"
+           "register is specified for"
      }}
   end
 
@@ -464,7 +451,34 @@ defmodule BB.Servo.Feetech.Actuator do
   # Clamped up to one raw unit, because a limit that rounds to 0 would mean the
   # opposite of what was asked for. One unit is slower than requested, which is
   # the safe direction to be wrong in.
-  defp write_acceleration(state), do: write_param(state, :acceleration, acceleration_raw(state))
+  # Read back rather than trusting a documented range. An STS3215 on firmware
+  # 3.10 silently clamps this register at 50 — a fifth of the 254 its byte and
+  # the SDK both allow — so the only reliable way to know whether the servo took
+  # the limit is to ask it. That also means a servo with a different ceiling
+  # needs nothing changed here.
+  defp write_acceleration(state) do
+    asked = acceleration_raw(state)
+
+    with :ok <- write_param(state, :acceleration, asked),
+         {:ok, accepted} <- read_param(state, :acceleration) do
+      check_acceleration(state, asked, accepted)
+    end
+  end
+
+  defp check_acceleration(_state, asked, asked), do: :ok
+
+  defp check_acceleration(state, asked, accepted) do
+    {:error,
+     %JointConfigError{
+       joint: state.joint_name,
+       field: :acceleration,
+       value: state.motor_profile.motor_acceleration_limit,
+       message:
+         "Joint is declared at #{degrees(asked * @radians_per_acceleration_unit)}/s² in " <>
+           "motor space, but the servo clamped its acceleration register to " <>
+           "#{degrees(accepted * @radians_per_acceleration_unit)}/s²"
+     }}
+  end
 
   defp acceleration_raw(%{motor_profile: %{motor_acceleration_limit: nil}}), do: 0
 

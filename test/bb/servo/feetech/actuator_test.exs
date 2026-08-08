@@ -49,6 +49,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
           {:read, _id, :model_number} -> {:ok, 777}
           {:read, _id, :mode} -> {:ok, :position}
           {:write, _id, :acceleration, _} -> :ok
+          {:read, _id, :acceleration} -> {:ok, 0}
           {:register_servo, _, _, _} -> {:ok, servo_table}
         end
       end)
@@ -90,6 +91,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
           {:read, _id, :model_number} -> {:ok, 777}
           {:read, _id, :mode} -> {:ok, :position}
           {:write, _id, :acceleration, _} -> :ok
+          {:read, _id, :acceleration} -> {:ok, 0}
           {:register_servo, _, _, _} -> {:ok, servo_table}
         end
       end)
@@ -110,6 +112,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       |> expect(:call, fn TestRobot, :feetech, {:read, 1, :model_number} -> {:ok, 777} end)
       |> expect(:call, fn TestRobot, :feetech, {:read, 1, :mode} -> {:ok, :position} end)
       |> expect(:call, fn TestRobot, :feetech, {:write, 1, :acceleration, 0} -> :ok end)
+      |> expect(:call, fn TestRobot, :feetech, {:read, 1, :acceleration} -> {:ok, 0} end)
       |> expect(:call, fn TestRobot, :feetech, {:register_servo, 1, [:shoulder, :servo], 2} ->
         {:ok, servo_table}
       end)
@@ -160,6 +163,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
 
     test "writes the joint's acceleration limit to the servo" do
       test_pid = self()
+      acc_expected = 246
 
       BB.Process
       |> stub(:call, fn _robot, _controller, msg ->
@@ -168,6 +172,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
           {:read, _id, :model_number} -> {:ok, 777}
           {:read, _id, :mode} -> {:ok, :position}
           {:register_servo, _, _, _} -> {:ok, :table}
+          {:read, _id, :acceleration} -> {:ok, acc_expected}
           {:write, _id, :acceleration, raw} -> send(test_pid, {:acceleration, raw}) && :ok
         end
       end)
@@ -183,6 +188,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
 
     test "writes 0 when the joint declares no acceleration limit" do
       test_pid = self()
+      acc_expected = 0
 
       BB.Process
       |> stub(:call, fn _robot, _controller, msg ->
@@ -191,6 +197,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
           {:read, _id, :model_number} -> {:ok, 777}
           {:read, _id, :mode} -> {:ok, :position}
           {:register_servo, _, _, _} -> {:ok, :table}
+          {:read, _id, :acceleration} -> {:ok, acc_expected}
           {:write, _id, :acceleration, raw} -> send(test_pid, {:acceleration, raw}) && :ok
         end
       end)
@@ -201,6 +208,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
 
     test "rounds a tiny acceleration limit up rather than down to no limit" do
       test_pid = self()
+      acc_expected = 1
 
       BB.Process
       |> stub(:call, fn _robot, _controller, msg ->
@@ -209,6 +217,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
           {:read, _id, :model_number} -> {:ok, 777}
           {:read, _id, :mode} -> {:ok, :position}
           {:register_servo, _, _, _} -> {:ok, :table}
+          {:read, _id, :acceleration} -> {:ok, acc_expected}
           {:write, _id, :acceleration, raw} -> send(test_pid, {:acceleration, raw}) && :ok
         end
       end)
@@ -220,13 +229,45 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       assert_received {:acceleration, 1}
     end
 
-    test "refuses a joint accelerating harder than the register can express" do
-      opts = base_opts(motor_profile: motor_profile(motor_acceleration_limit: 100.0))
+    test "refuses when the servo clamps the acceleration it was given" do
+      # An STS3215 on firmware 3.10 clamps this register at 50, a fifth of what
+      # its byte and the SDK both allow.
+      BB.Process
+      |> stub(:call, fn _robot, _controller, msg ->
+        case msg do
+          {:write, _id, :torque_enable, false} -> :ok
+          {:read, _id, :model_number} -> {:ok, 777}
+          {:read, _id, :mode} -> {:ok, :position}
+          {:write, _id, :acceleration, _} -> :ok
+          {:read, _id, :acceleration} -> {:ok, 50}
+          {:register_servo, _, _, _} -> {:ok, :table}
+        end
+      end)
+
+      opts = base_opts(motor_profile: motor_profile(motor_acceleration_limit: 37.699))
 
       assert {:stop, %BB.Error.Invalid.JointConfig{field: :acceleration} = error} =
                Actuator.init(opts)
 
-      assert error.message =~ "beyond the"
+      assert error.message =~ "clamped its acceleration register to 439.5°/s²"
+    end
+
+    test "accepts an acceleration the servo takes unchanged" do
+      BB.Process
+      |> stub(:call, fn _robot, _controller, msg ->
+        case msg do
+          {:write, _id, :torque_enable, false} -> :ok
+          {:read, _id, :model_number} -> {:ok, 777}
+          {:read, _id, :mode} -> {:ok, :position}
+          {:write, _id, :acceleration, _} -> :ok
+          {:read, _id, :acceleration} -> {:ok, 30}
+          {:register_servo, _, _, _} -> {:ok, :table}
+        end
+      end)
+
+      opts = base_opts(motor_profile: motor_profile(motor_acceleration_limit: 30 * 0.153398))
+
+      assert {:ok, _state} = Actuator.init(opts)
     end
 
     test "refuses to start when :controller doesn't name a declared controller" do
@@ -276,6 +317,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
           {:read, _id, :model_number} -> {:ok, 777}
           {:read, _id, :mode} -> {:ok, :position}
           {:write, _id, :acceleration, _} -> :ok
+          {:read, _id, :acceleration} -> {:ok, 0}
           {:register_servo, _, _, _} -> {:error, taken}
         end
       end)
@@ -291,7 +333,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       assert {:stop, %BB.Error.Invalid.JointConfig{field: :velocity} = error} =
                Actuator.init(opts)
 
-      assert error.message =~ "faster than"
+      assert error.message =~ "specified for"
     end
 
     test "accepts a joint at exactly the top of the speed register" do
@@ -354,6 +396,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
           {:write, _id, :torque_enable, false} -> :ok
           {:read, _id, :mode} -> {:ok, :position}
           {:write, _id, :acceleration, _} -> :ok
+          {:read, _id, :acceleration} -> {:ok, 0}
           {:register_servo, _, _, _} -> {:ok, servo_table}
         end
       end)
@@ -367,10 +410,12 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       |> stub(:call, fn _robot, _controller, msg ->
         case msg do
           {:write, _id, :torque_enable, false} -> :ok
+          {:read, _id, :acceleration} -> {:ok, 0}
           {:write, _id, :mode, _} -> flunk("rewrote a mode the servo was already in")
           {:read, _id, :model_number} -> {:ok, 777}
           {:read, _id, :mode} -> {:ok, :velocity}
           {:write, _id, :acceleration, _} -> :ok
+          {:read, _id, :acceleration} -> {:ok, 0}
           {:register_servo, _, _, _} -> {:ok, :table}
         end
       end)
@@ -388,6 +433,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
           {:write, _id, :torque_enable, false} -> :ok
           {:read, _id, :model_number} -> {:ok, 777}
           {:read, _id, :mode} -> {:ok, :position}
+          {:read, _id, :acceleration} -> {:ok, 0}
           {:register_servo, _, _, _} -> {:ok, :table}
           {:write, _id, param, value} -> send(test_pid, {param, value}) && :ok
         end
