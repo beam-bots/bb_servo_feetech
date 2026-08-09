@@ -702,21 +702,46 @@ defmodule BB.Servo.Feetech.Actuator do
   defp do_set_position(%Command.Position{} = cmd, state) do
     state = cancel_trajectory(state)
     clamped_motor_angle = clamp_motor_angle(cmd.position, state.motor_profile)
+    distance = abs(state.current_motor_angle - clamped_motor_angle)
+    goal_speed = travel_speed(cmd.velocity, cmd.duration, distance, state)
 
-    goal_speed = compute_goal_speed(cmd, clamped_motor_angle, state)
-    goal_position = motor_angle_to_position(clamped_motor_angle)
-
-    writes = [{:position_move, {goal_position, speed_to_raw(goal_speed)}}]
-
-    case apply_write(state, writes) do
-      :ok ->
+    case move_to(clamped_motor_angle, goal_speed, state) do
+      {:ok, moved} ->
         publish_begin_motion(cmd, clamped_motor_angle, goal_speed, state)
-        {:noreply, %{state | current_motor_angle: clamped_motor_angle}}
+        {:noreply, moved}
 
       {:error, reason} ->
         {:stop, reason, state}
     end
   end
+
+  # Position commands and trajectory waypoints are the same move with different
+  # paperwork, so they share this. Splitting them is how the trajectory came to
+  # miss the time-derived speed that `duration` gets.
+  defp move_to(clamped_motor_angle, goal_speed, state) do
+    writes = [
+      {:position_move, {motor_angle_to_position(clamped_motor_angle), speed_to_raw(goal_speed)}}
+    ]
+
+    case apply_write(state, writes) do
+      :ok -> {:ok, %{state | current_motor_angle: clamped_motor_angle}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # Travel as fast as asked, or fast enough to arrive in the time allowed, or at
+  # the joint's limit. A `goal_speed` of zero means "as fast as you can" to the
+  # servo, which is never what a caller means by asking for nothing.
+  defp travel_speed(velocity, _duration, _distance, state)
+       when is_number(velocity) and velocity != 0,
+       do: clamp_speed(abs(velocity), state)
+
+  defp travel_speed(_velocity, duration, distance, state)
+       when is_integer(duration) and duration > 0,
+       do: clamp_speed(distance / (duration / 1000), state)
+
+  defp travel_speed(_velocity, _duration, _distance, state),
+    do: clamp_speed(state.motor_profile.motor_velocity_limit, state)
 
   defp publish_begin_motion(cmd, clamped_motor_angle, goal_speed, state) do
     travel_time_ms = estimate_travel_time_ms(clamped_motor_angle, goal_speed, state)
@@ -733,23 +758,6 @@ defmodule BB.Servo.Feetech.Actuator do
 
     BB.Actuator.publish_begin_motion(state.bb.robot, state.bb.path, message_opts)
   end
-
-  # A `goal_speed` of 0 means "as fast as the servo can", which ignores the
-  # joint's declared velocity limit and arrives sooner than the `BeginMotion`
-  # estimate — computed from that limit — predicts. Falling back to the limit
-  # makes it real. Anything the caller asks for is clamped to it too.
-  defp compute_goal_speed(%Command.Position{velocity: velocity}, _clamped_angle, state)
-       when is_number(velocity) and velocity != 0,
-       do: clamp_speed(abs(velocity), state)
-
-  defp compute_goal_speed(%Command.Position{duration: duration}, clamped_motor_angle, state)
-       when is_integer(duration) and duration > 0 do
-    travel_distance = abs(state.current_motor_angle - clamped_motor_angle)
-    clamp_speed(travel_distance / (duration / 1000), state)
-  end
-
-  defp compute_goal_speed(_cmd, _clamped_angle, state),
-    do: clamp_speed(state.motor_profile.motor_velocity_limit, state)
 
   # The span is written raw, so the speed is converted here. In position mode it
   # is always a magnitude, which makes sign-magnitude and a plain integer the
@@ -858,30 +866,33 @@ defmodule BB.Servo.Feetech.Actuator do
   defp execute_and_schedule(trajectory, state) do
     waypoint = Enum.at(trajectory.waypoints, trajectory.index)
     clamped_motor_angle = clamp_motor_angle(waypoint[:position], state.motor_profile)
-    goal_speed = waypoint_speed(waypoint, state)
-    goal_position = motor_angle_to_position(clamped_motor_angle)
+    distance = abs(state.current_motor_angle - clamped_motor_angle)
 
-    writes = [{:position_move, {goal_position, speed_to_raw(goal_speed)}}]
+    goal_speed =
+      travel_speed(waypoint[:velocity], leg_duration_ms(trajectory, waypoint), distance, state)
 
-    case apply_write(state, writes) do
-      :ok ->
-        state = %{state | current_motor_angle: clamped_motor_angle}
-        {:noreply, schedule_next_waypoint(trajectory, waypoint, state)}
-
-      {:error, reason} ->
-        {:stop, reason, state}
+    case move_to(clamped_motor_angle, goal_speed, state) do
+      {:ok, moved} -> {:noreply, schedule_next_waypoint(trajectory, waypoint, moved)}
+      {:error, reason} -> {:stop, reason, state}
     end
   end
 
-  # A waypoint with no velocity of its own travels at the joint's limit rather
-  # than at the servo's maximum, the same as a bare position command.
-  defp waypoint_speed(waypoint, state) do
-    velocity = waypoint[:velocity]
+  # How long this leg has, which is the same interval the scheduler waits before
+  # commanding the next waypoint — so the joint arrives just as the next one is
+  # asked for, rather than racing there and sitting still. The last waypoint has
+  # no interval, and falls back to the joint's limit.
+  #
+  # `Command.Trajectory` currently requires a velocity on every waypoint, so
+  # this only decides the speed for a waypoint whose velocity is zero. It falls
+  # out of sharing `travel_speed/4` with position commands rather than being
+  # written for its own sake, and becomes load-bearing if that schema ever
+  # allows positions-and-times trajectories.
+  defp leg_duration_ms(trajectory, waypoint) do
+    next_index = trajectory.index + 1
 
-    if is_number(velocity) and velocity != 0 do
-      clamp_speed(abs(velocity), state)
-    else
-      clamp_speed(state.motor_profile.motor_velocity_limit, state)
+    if next_index < length(trajectory.waypoints) do
+      next = Enum.at(trajectory.waypoints, next_index)
+      next[:time_from_start] - waypoint[:time_from_start]
     end
   end
 

@@ -731,6 +731,70 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       assert_in_delta goal_speed, 1.0, 0.001
     end
 
+    # These build the payload directly. `Command.Trajectory` requires a velocity
+    # on every waypoint, so a nil one cannot arrive through `BB.Actuator`
+    # today — the behaviour is covered because it is what the shared speed
+    # logic does, and it would go live the moment that schema relaxes.
+    test "a waypoint with no velocity paces itself across the leg", %{
+      state: state,
+      servo_table: servo_table
+    } do
+      # 0.2 rad in the 500ms before the next waypoint is commanded = 0.4 rad/s,
+      # rather than bolting there at the joint's limit and waiting
+      cmd = %Command.Trajectory{
+        waypoints: [
+          [position: 0.2, acceleration: 0.0, time_from_start: 0],
+          [position: 0.4, acceleration: 0.0, time_from_start: 500]
+        ]
+      }
+
+      assert {:noreply, _state} = Actuator.handle_command(%Message{payload: cmd}, state)
+      assert_in_delta goal(servo_table, :goal_speed), 0.4, 0.002
+    end
+
+    test "a stated waypoint velocity still wins over the leg time", %{
+      state: state,
+      servo_table: servo_table
+    } do
+      cmd = %Command.Trajectory{
+        waypoints: [
+          [position: 0.2, velocity: 0.1, acceleration: 0.0, time_from_start: 0],
+          [position: 0.4, acceleration: 0.0, time_from_start: 500]
+        ]
+      }
+
+      assert {:noreply, _state} = Actuator.handle_command(%Message{payload: cmd}, state)
+      assert_in_delta goal(servo_table, :goal_speed), 0.1, 0.002
+    end
+
+    test "the final waypoint has no leg, so it travels at the joint's limit", %{
+      state: state,
+      servo_table: servo_table
+    } do
+      cmd = %Command.Trajectory{
+        waypoints: [[position: 0.2, acceleration: 0.0, time_from_start: 0]]
+      }
+
+      assert {:noreply, _state} = Actuator.handle_command(%Message{payload: cmd}, state)
+      assert_in_delta goal(servo_table, :goal_speed), @pi / 3, 0.002
+    end
+
+    test "a leg demanding more than the joint allows is clamped", %{
+      state: state,
+      servo_table: servo_table
+    } do
+      # 1.0 rad in 100ms would need 10 rad/s against a limit of pi/3
+      cmd = %Command.Trajectory{
+        waypoints: [
+          [position: 1.0, acceleration: 0.0, time_from_start: 0],
+          [position: 1.2, acceleration: 0.0, time_from_start: 100]
+        ]
+      }
+
+      assert {:noreply, _state} = Actuator.handle_command(%Message{payload: cmd}, state)
+      assert_in_delta goal(servo_table, :goal_speed), @pi / 3, 0.002
+    end
+
     test "publishes BeginMotion with command_type :trajectory", %{state: state} do
       BB.Actuator
       |> expect(:publish_begin_motion, fn TestRobot, [:shoulder, :servo], opts ->
