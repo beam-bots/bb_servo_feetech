@@ -767,7 +767,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       assert_in_delta goal(servo_table, :goal_speed), 0.1, 0.002
     end
 
-    test "the final waypoint has no leg, so it travels at the joint's limit", %{
+    test "a lone waypoint has no leg at all, so it travels at the joint's limit", %{
       state: state,
       servo_table: servo_table
     } do
@@ -777,6 +777,25 @@ defmodule BB.Servo.Feetech.ActuatorTest do
 
       assert {:noreply, _state} = Actuator.handle_command(%Message{payload: cmd}, state)
       assert_in_delta goal(servo_table, :goal_speed), @pi / 3, 0.002
+    end
+
+    test "the final waypoint borrows the interval before it rather than lunging", %{
+      state: state,
+      servo_table: servo_table
+    } do
+      cmd = %Command.Trajectory{
+        waypoints: [
+          [position: 0.2, acceleration: 0.0, time_from_start: 0],
+          [position: 0.4, acceleration: 0.0, time_from_start: 500]
+        ]
+      }
+
+      assert {:noreply, state} = Actuator.handle_command(%Message{payload: cmd}, state)
+      assert {:noreply, _state} = Actuator.handle_info(:trajectory_next, state)
+
+      # the last leg is 0.2 rad over the 500ms the planner allowed = 0.4 rad/s,
+      # not the joint's limit
+      assert_in_delta goal(servo_table, :goal_speed), 0.4, 0.002
     end
 
     test "a leg demanding more than the joint allows is clamped", %{

@@ -877,22 +877,27 @@ defmodule BB.Servo.Feetech.Actuator do
     end
   end
 
-  # How long this leg has, which is the same interval the scheduler waits before
-  # commanding the next waypoint — so the joint arrives just as the next one is
-  # asked for, rather than racing there and sitting still. The last waypoint has
-  # no interval, and falls back to the joint's limit.
+  # How long this leg has. Normally that is the interval before the next
+  # waypoint is commanded, so the joint arrives just as the next one is asked
+  # for rather than racing there and sitting still.
   #
-  # `Command.Trajectory` currently requires a velocity on every waypoint, so
-  # this only decides the speed for a waypoint whose velocity is zero. It falls
-  # out of sharing `travel_speed/4` with position commands rather than being
-  # written for its own sake, and becomes load-bearing if that schema ever
-  # allows positions-and-times trajectories.
+  # The last waypoint has no interval after it, and falling back to the joint's
+  # limit made every trajectory finish with a lunge. The time the planner
+  # allowed to reach it is the interval before it, so use that.
   defp leg_duration_ms(trajectory, waypoint) do
     next_index = trajectory.index + 1
 
-    if next_index < length(trajectory.waypoints) do
-      next = Enum.at(trajectory.waypoints, next_index)
-      next[:time_from_start] - waypoint[:time_from_start]
+    cond do
+      next_index < length(trajectory.waypoints) ->
+        next = Enum.at(trajectory.waypoints, next_index)
+        next[:time_from_start] - waypoint[:time_from_start]
+
+      trajectory.index > 0 ->
+        previous = Enum.at(trajectory.waypoints, trajectory.index - 1)
+        waypoint[:time_from_start] - previous[:time_from_start]
+
+      true ->
+        nil
     end
   end
 
