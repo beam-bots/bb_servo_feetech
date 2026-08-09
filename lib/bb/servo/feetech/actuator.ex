@@ -710,7 +710,7 @@ defmodule BB.Servo.Feetech.Actuator do
 
     case apply_write(state, writes) do
       :ok ->
-        publish_begin_motion(cmd, clamped_motor_angle, state)
+        publish_begin_motion(cmd, clamped_motor_angle, goal_speed, state)
         {:noreply, %{state | current_motor_angle: clamped_motor_angle}}
 
       {:error, reason} ->
@@ -718,8 +718,8 @@ defmodule BB.Servo.Feetech.Actuator do
     end
   end
 
-  defp publish_begin_motion(cmd, clamped_motor_angle, state) do
-    travel_time_ms = estimate_travel_time_ms(cmd, clamped_motor_angle, state)
+  defp publish_begin_motion(cmd, clamped_motor_angle, goal_speed, state) do
+    travel_time_ms = estimate_travel_time_ms(clamped_motor_angle, goal_speed, state)
     expected_arrival = System.monotonic_time(:millisecond) + travel_time_ms
 
     message_opts =
@@ -739,7 +739,7 @@ defmodule BB.Servo.Feetech.Actuator do
   # estimate — computed from that limit — predicts. Falling back to the limit
   # makes it real. Anything the caller asks for is clamped to it too.
   defp compute_goal_speed(%Command.Position{velocity: velocity}, _clamped_angle, state)
-       when is_number(velocity),
+       when is_number(velocity) and velocity != 0,
        do: clamp_speed(abs(velocity), state)
 
   defp compute_goal_speed(%Command.Position{duration: duration}, clamped_motor_angle, state)
@@ -770,20 +770,14 @@ defmodule BB.Servo.Feetech.Actuator do
     ArgumentError -> false
   end
 
-  defp estimate_travel_time_ms(%Command.Position{velocity: velocity}, clamped_motor_angle, state)
-       when is_number(velocity) and velocity > 0 do
+  # Estimated from the speed the servo was actually given, not from what the
+  # caller asked for. A `duration` that would need more speed than the joint
+  # allows is clamped, and echoing the request back would promise an arrival
+  # the joint cannot make — the same gap between prediction and hardware that
+  # writing the velocity limit set out to close.
+  defp estimate_travel_time_ms(clamped_motor_angle, goal_speed, state) do
     travel_distance = abs(state.current_motor_angle - clamped_motor_angle)
-    round(travel_distance / abs(velocity) * 1000)
-  end
-
-  defp estimate_travel_time_ms(%Command.Position{duration: duration}, _clamped_angle, _state)
-       when is_integer(duration) and duration > 0 do
-    duration
-  end
-
-  defp estimate_travel_time_ms(_cmd, clamped_motor_angle, state) do
-    travel_distance = abs(state.current_motor_angle - clamped_motor_angle)
-    round(travel_distance / state.motor_profile.motor_velocity_limit * 1000)
+    round(travel_distance / goal_speed * 1000)
   end
 
   # --- Trajectory commands ---

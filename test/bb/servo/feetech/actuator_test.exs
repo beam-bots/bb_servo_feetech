@@ -659,6 +659,37 @@ defmodule BB.Servo.Feetech.ActuatorTest do
                Actuator.handle_command(msg, state)
     end
 
+    test "a duration the joint cannot meet reports the arrival it can", %{state: state} do
+      # 1.0 rad in 200ms needs 5 rad/s; the joint's limit is pi/3 (~1.047),
+      # so the move is clamped and actually takes about 955ms.
+      BB.Actuator
+      |> expect(:publish_begin_motion, fn TestRobot, [:shoulder, :servo], opts ->
+        now = System.monotonic_time(:millisecond)
+        honest = round(1.0 / (@pi / 3) * 1000)
+        assert_in_delta opts[:expected_arrival], now + honest, 50
+        refute_in_delta opts[:expected_arrival], now + 200, 50
+        :ok
+      end)
+
+      # the joint's upper limit is pi/2, so 1.0 rad is reachable
+      cmd = %Command.Position{position: 1.0, duration: 200}
+
+      assert {:noreply, _state} = Actuator.handle_command(%Message{payload: cmd}, state)
+    end
+
+    test "a velocity of zero falls back to the joint's limit", %{
+      state: state,
+      servo_table: servo_table
+    } do
+      cmd = %Command.Position{position: 0.5, velocity: 0.0}
+
+      assert {:noreply, _state} = Actuator.handle_command(%Message{payload: cmd}, state)
+
+      # 0 means "as fast as you can" to the servo, which is not what asking for
+      # zero can plausibly mean, and it would divide by zero in the estimate.
+      assert_in_delta goal(servo_table, :goal_speed), @pi / 3, 0.001
+    end
+
     test "velocity hint takes precedence over duration hint", %{
       state: state,
       servo_table: servo_table
