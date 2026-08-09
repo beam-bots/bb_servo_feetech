@@ -51,12 +51,33 @@ defmodule BB.Servo.Feetech.Controller do
       {servo_id, actuator_path, position_deadband,
        last_position_raw, present_position, present_temperature,
        present_voltage, present_load, hardware_error,
-       goal_position, goal_speed}
+       pending_writes, pending_limit, torque_enabled}
 
-  Actuators write `goal_position` (raw motor units) and `goal_speed` (motor
-  rad/s) via `:ets.update_element/3`. The controller reads and clears them
-  each tick and uses `BB.Actuator.to_joint_space/3` to translate encoder
-  readings to joint-space before publishing `JointState`.
+  Actuators write `pending_writes` — a list of `{param, value}` pairs naming
+  whichever goal registers their operating mode acts on — via
+  `:ets.update_element/3`. The controller groups them by param each tick so a
+  position move's `goal_position` and `goal_speed` still leave as one
+  `sync_write` each, then clears them. It uses `BB.Actuator.to_joint_space/3` to
+  translate encoder readings to joint-space before publishing `JointState`.
+
+  `pending_limit` is the torque ceiling, and has a slot of its own because it
+  isn't a goal. A new motion command supersedes the last one, so `pending_writes`
+  is replaced wholesale; a ceiling outlives the move it was set for, and would be
+  lost if an `Effort` and a `Position` arriving in the same tick had to share a
+  slot.
+
+  ## Torque state
+
+  `torque_enabled` caches what this controller last told each servo, so an
+  actuator can tell whether its goal will actually be acted on without spending
+  a bus round trip per command. Every write to `torque_enable` passes through
+  this controller — the actuators, the parameter bridge and arming all go
+  through `handle_call/3` or `enable_all_torque/1` — which is what makes the
+  cache trustworthy.
+
+  It is only meaningful while the robot is armed. Disarming turns torque off
+  without updating the cache, because commands can't reach an actuator in that
+  state anyway, and arming re-establishes it for every registered servo.
 
   ## Safety
 
@@ -118,8 +139,9 @@ defmodule BB.Servo.Feetech.Controller do
   @idx_present_voltage 7
   @idx_present_load 8
   @idx_hardware_error 9
-  @idx_goal_position 10
-  @idx_goal_speed 11
+  @idx_pending_writes 10
+  @idx_pending_limit 11
+  @idx_torque_enabled 12
 
   # Diagnostic thresholds (Feetech servos typically run on 6-7.4V)
   @temp_warning_threshold 55.0
@@ -231,33 +253,14 @@ defmodule BB.Servo.Feetech.Controller do
         _from,
         state
       ) do
-    :ets.insert(state.servo_table, {
-      servo_id,
-      actuator_path,
-      position_deadband,
-      _last_position_raw = nil,
-      _present_position = nil,
-      _present_temperature = nil,
-      _present_voltage = nil,
-      _present_load = nil,
-      _hardware_error = nil,
-      _goal_position = nil,
-      _goal_speed = nil
-    })
+    case registered_path(state, servo_id) do
+      taken when taken not in [nil, actuator_path] ->
+        {:reply, {:error, duplicate_servo_id(servo_id, actuator_path, taken)}, state}
 
-    servo_ids = [servo_id | state.servo_ids] |> Enum.sort() |> Enum.uniq()
-
-    BB.Safety.register(__MODULE__,
-      robot: state.bb.robot,
-      path: state.bb.path,
-      opts: [
-        feetech: state.feetech,
-        servo_ids: servo_ids,
-        disarm_action: state.disarm_action
-      ]
-    )
-
-    {:reply, {:ok, state.servo_table}, %{state | servo_ids: servo_ids}}
+      _free_or_ours ->
+        insert_servo_row(state, servo_id, actuator_path, position_deadband)
+        {:reply, {:ok, state.servo_table}, track_servo_id(state, servo_id)}
+    end
   end
 
   def handle_call({:read, servo_id, param}, _from, state) do
@@ -270,13 +273,27 @@ defmodule BB.Servo.Feetech.Controller do
     {:reply, result, state}
   end
 
+  def handle_call({:write, servo_id, :torque_enable, value}, _from, state) do
+    result = Feetech.write(state.feetech, servo_id, :torque_enable, value, await_response: true)
+    cache_torque_state(state, servo_id, value, result)
+    {:reply, result, state}
+  end
+
   def handle_call({:write, servo_id, param, value}, _from, state) do
-    result = Feetech.write(state.feetech, servo_id, param, value, await: true)
+    result = Feetech.write(state.feetech, servo_id, param, value, await_response: true)
+    {:reply, result, state}
+  end
+
+  def handle_call({:write_raw, servo_id, :torque_enable, value}, _from, state) do
+    result =
+      Feetech.write_raw(state.feetech, servo_id, :torque_enable, value, await_response: true)
+
+    cache_torque_state(state, servo_id, value != 0, result)
     {:reply, result, state}
   end
 
   def handle_call({:write_raw, servo_id, param, value}, _from, state) do
-    result = Feetech.write_raw(state.feetech, servo_id, param, value, await: true)
+    result = Feetech.write_raw(state.feetech, servo_id, param, value, await_response: true)
     {:reply, result, state}
   end
 
@@ -296,6 +313,75 @@ defmodule BB.Servo.Feetech.Controller do
 
   def handle_call(:get_control_table, _from, state) do
     {:reply, {:ok, state.control_table}, state}
+  end
+
+  # Bring a passive servo back under power without it snapping to the goal it
+  # was chasing when torque was cut. The goal registers are SRAM and survive
+  # torque being off, so the new goal has to land — acknowledged — before torque
+  # comes back on; otherwise the servo lunges for a stale target from wherever
+  # it has come to rest. `:present_position` means hold station at wherever
+  # that is.
+  def handle_call({:resume_servo, servo_id, pending_writes}, _from, state) do
+    {:reply, resume_servo(state, servo_id, pending_writes), state}
+  end
+
+  # --- Servo registration ---
+
+  # The table is keyed on the servo ID, so a second actuator claiming one would
+  # take over the first's row: only the later joint would get position feedback,
+  # and the two would overwrite each other's pending writes every tick. An
+  # actuator that has restarted re-registers under its own path, and gets a
+  # fresh row.
+  #
+  # Two *servos* sharing an ID is a different problem, and one the bus reports
+  # for itself — they both answer the same read and the frames collide.
+  defp registered_path(state, servo_id) do
+    case :ets.lookup(state.servo_table, servo_id) do
+      [{^servo_id, actuator_path, _, _, _, _, _, _, _, _, _, _}] -> actuator_path
+      [] -> nil
+    end
+  end
+
+  defp duplicate_servo_id(servo_id, actuator_path, registered_path) do
+    %BB.Error.Invalid.Feetech.DuplicateServoId{
+      servo_id: servo_id,
+      actuator_path: actuator_path,
+      registered_path: registered_path
+    }
+  end
+
+  defp track_servo_id(state, servo_id) do
+    servo_ids = [servo_id | state.servo_ids] |> Enum.sort() |> Enum.uniq()
+
+    BB.Safety.register(__MODULE__,
+      robot: state.bb.robot,
+      path: state.bb.path,
+      opts: [
+        feetech: state.feetech,
+        servo_ids: servo_ids,
+        disarm_action: state.disarm_action
+      ]
+    )
+
+    %{state | servo_ids: servo_ids}
+  end
+
+  defp insert_servo_row(state, servo_id, actuator_path, position_deadband) do
+    :ets.insert(state.servo_table, {
+      servo_id,
+      actuator_path,
+      position_deadband,
+      _last_position_raw = nil,
+      _present_position = nil,
+      _present_temperature = nil,
+      _present_voltage = nil,
+      _present_load = nil,
+      _hardware_error = nil,
+      _pending_writes = nil,
+      _pending_limit = nil,
+      # The actuator disables torque before it registers.
+      _torque_enabled = false
+    })
   end
 
   # --- Handle info ---
@@ -334,27 +420,104 @@ defmodule BB.Servo.Feetech.Controller do
     entries = :ets.tab2list(state.servo_table)
 
     commands =
-      for {id, _, _, _, _, _, _, _, _, goal_pos, goal_speed} <- entries,
-          goal_pos != nil,
-          do: {id, goal_pos, goal_speed || 0}
+      for {id, _, _, _, _, _, _, _, _, pending_writes, pending_limit, _} <- entries,
+          writes = pending_command(pending_writes, pending_limit),
+          do: {id, writes}
 
     if commands != [] do
-      speed_values = for {id, _, speed} <- commands, do: {id, speed}
-      position_values = for {id, pos, _} <- commands, do: {id, pos}
+      write_by_param(state, commands)
 
-      Feetech.sync_write(state.feetech, :goal_speed, speed_values)
-      Feetech.sync_write_raw(state.feetech, :goal_position, position_values)
-
-      for {id, _, _} <- commands do
-        :ets.update_element(state.servo_table, id, [
-          {@idx_goal_position, nil},
-          {@idx_goal_speed, nil}
-        ])
+      for {id, _} <- commands do
+        :ets.update_element(
+          state.servo_table,
+          id,
+          [{@idx_pending_writes, nil}, {@idx_pending_limit, nil}]
+        )
       end
     end
 
     state
   end
+
+  defp pending_command(nil, nil), do: nil
+  defp pending_command(nil, limit), do: [{:torque_limit, limit}]
+  defp pending_command(writes, nil), do: writes
+  defp pending_command(writes, limit), do: [{:torque_limit, limit} | writes]
+
+  # Batching is the whole point of this loop: whatever mix of goal registers the
+  # actuators asked for, each one leaves as a single `sync_write` covering every
+  # servo that wanted it. The ceiling goes on before the goal that might reach
+  # it, and the speed before the position that travels at it.
+  @param_write_order [:torque_limit, :goal_speed, :goal_position]
+
+  # A servo begins moving the moment `goal_position` lands, so a speed sent in a
+  # following packet can arrive after the move has started and be ignored for
+  # it — intermittently, which is the worst way to be wrong. The three registers
+  # are adjacent, so one `sync_write` carries them together and the servo can
+  # never act on a stale speed. `goal_time` is inert on the firmware we have
+  # measured; it is here because the span has to be contiguous.
+  @position_span [:goal_position, :goal_time, :goal_speed]
+
+  # Split by write rather than by command: a servo can have a torque ceiling and
+  # a position move pending in the same tick, and the ceiling has to go out with
+  # the others rather than being swallowed by the span.
+  defp write_by_param(state, commands) do
+    moves =
+      for {id, writes} <- commands,
+          {:position_move, {position, speed}} <- writes,
+          do: {id, [position, 0, speed]}
+
+    others =
+      commands
+      |> Enum.map(fn {id, writes} ->
+        {id, Enum.reject(writes, &match?({:position_move, _}, &1))}
+      end)
+      |> Enum.reject(fn {_id, writes} -> writes == [] end)
+
+    # the ceiling before the goal that might reach it
+    write_single_params(state, others)
+    write_position_moves(state, moves)
+  end
+
+  defp write_position_moves(_state, []), do: :ok
+
+  defp write_position_moves(state, moves),
+    do: Feetech.sync_write_raw(state.feetech, @position_span, moves)
+
+  defp write_single_params(state, commands) do
+    by_param =
+      for {id, writes} <- commands,
+          {param, value} <- writes,
+          reduce: %{} do
+        acc -> Map.update(acc, param, [{id, value}], &[{id, value} | &1])
+      end
+
+    ordered = @param_write_order ++ (Map.keys(by_param) -- @param_write_order)
+
+    for param <- ordered, Map.has_key?(by_param, param) do
+      sync_write_param(state, param, Map.fetch!(by_param, param))
+    end
+  end
+
+  # Pending writes carry the units `Feetech.write/5` takes, so the control table
+  # does the encoding — which is what gets a negative `goal_speed` onto the bus
+  # as sign-magnitude rather than two's complement. `goal_position` is the
+  # exception: the control table's conversion is signed about zero, while this
+  # driver puts motor zero at the encoder midpoint, so the actuator has already
+  # done that arithmetic and hands over raw encoder units.
+  @raw_params [:goal_position]
+
+  defp sync_write_param(state, param, values) when param in @raw_params,
+    do: Feetech.sync_write_raw(state.feetech, param, values)
+
+  defp sync_write_param(state, param, values),
+    do: Feetech.sync_write(state.feetech, param, values)
+
+  defp write_param(state, servo_id, param, value) when param in @raw_params,
+    do: Feetech.write_raw(state.feetech, servo_id, param, value, await_response: true)
+
+  defp write_param(state, servo_id, param, value),
+    do: Feetech.write(state.feetech, servo_id, param, value, await_response: true)
 
   defp read_positions(%{servo_ids: []} = state), do: state
 
@@ -396,7 +559,7 @@ defmodule BB.Servo.Feetech.Controller do
   defp maybe_publish_position(state, servo_id, position_rad) do
     case :ets.lookup(state.servo_table, servo_id) do
       [
-        {^servo_id, actuator_path, position_deadband, last_position_raw, _, _, _, _, _, _, _}
+        {^servo_id, actuator_path, position_deadband, last_position_raw, _, _, _, _, _, _, _, _}
       ] ->
         if should_publish_position?(position_rad, last_position_raw, position_deadband) do
           # The Feetech servo reads back an absolute position in [0, 2π) radians,
@@ -443,6 +606,90 @@ defmodule BB.Servo.Feetech.Controller do
     actuator_path |> Enum.reverse() |> Enum.at(1)
   end
 
+  # --- Torque ---
+
+  defp resume_servo(state, servo_id, pending_writes) do
+    with {:ok, writes} <- resolve_present_position(state, servo_id, pending_writes),
+         :ok <- write_each(state, servo_id, writes),
+         :ok <- enable_torque(state, servo_id) do
+      # The goals have been written directly, so anything the actuator left
+      # pending for the next tick is already spent.
+      :ets.update_element(state.servo_table, servo_id, [
+        {@idx_pending_writes, nil},
+        {@idx_torque_enabled, true}
+      ])
+
+      :ok
+    end
+  end
+
+  # `:present_position` is the actuator asking to hold station wherever the joint
+  # has come to rest, which only the bus can answer.
+  defp resolve_present_position(state, servo_id, pending_writes) do
+    if List.keymember?(pending_writes, :present_position, 0) do
+      case Feetech.read_raw(state.feetech, servo_id, :present_position) do
+        {:ok, position} ->
+          {:ok,
+           List.keyreplace(
+             pending_writes,
+             :present_position,
+             0,
+             {:goal_position, position}
+           )}
+
+        {:error, reason} ->
+          {:error, {:servo, servo_id, :present_position, reason}}
+      end
+    else
+      {:ok, pending_writes}
+    end
+  end
+
+  defp write_each(state, servo_id, pending_writes) do
+    Enum.reduce_while(pending_writes, :ok, fn write, :ok ->
+      case write_pending(state, servo_id, write) do
+        {:ok, _status} -> {:cont, :ok}
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, {:servo, servo_id, elem(write, 0), reason}}}
+      end
+    end)
+  end
+
+  # Torque is off on the resume path, so the servo cannot start moving before
+  # the speed lands and the two writes need not be atomic. They do need
+  # acknowledging before torque comes back on, which a sync write cannot give.
+  defp write_pending(state, servo_id, {:position_move, {position, speed}}) do
+    with :ok <- acknowledged(state, servo_id, :goal_speed, speed) do
+      acknowledged(state, servo_id, :goal_position, position)
+    end
+  end
+
+  defp write_pending(state, servo_id, {param, value}),
+    do: write_param(state, servo_id, param, value)
+
+  defp acknowledged(state, servo_id, param, value) do
+    case Feetech.write_raw(state.feetech, servo_id, param, value, await_response: true) do
+      {:ok, _status} -> :ok
+      :ok -> :ok
+      {:error, _} = error -> error
+    end
+  end
+
+  defp enable_torque(state, servo_id) do
+    case Feetech.write(state.feetech, servo_id, :torque_enable, true, await_response: true) do
+      {:ok, _status} -> :ok
+      :ok -> :ok
+      {:error, reason} -> {:error, {:servo, servo_id, :torque_enable, reason}}
+    end
+  end
+
+  defp cache_torque_state(_state, _servo_id, _enabled?, {:error, _reason}), do: false
+
+  # An actuator disables torque before it registers, so the row may not exist
+  # yet — `update_element/3` reports that with `false` rather than raising.
+  defp cache_torque_state(state, servo_id, enabled?, _result),
+    do: :ets.update_element(state.servo_table, servo_id, [{@idx_torque_enabled, enabled?}])
+
   # --- Arming ---
 
   defp enable_all_torque(%{servo_ids: []}), do: :ok
@@ -460,7 +707,13 @@ defmodule BB.Servo.Feetech.Controller do
     torque_on = Enum.map(servo_ids, fn id -> {id, 1} end)
     Feetech.sync_write_raw(state.feetech, :torque_enable, torque_on)
     lock_values = Enum.map(servo_ids, fn id -> {id, 1} end)
-    Feetech.sync_write_raw(state.feetech, :lock, lock_values)
+    result = Feetech.sync_write_raw(state.feetech, :lock, lock_values)
+
+    Enum.each(servo_ids, fn id ->
+      :ets.update_element(state.servo_table, id, [{@idx_torque_enabled, true}])
+    end)
+
+    result
   end
 
   defp buffer_goal_positions(feetech, servo_ids, positions) do
@@ -584,7 +837,7 @@ defmodule BB.Servo.Feetech.Controller do
 
   defp get_joint_name(state, servo_id) do
     case :ets.lookup(state.servo_table, servo_id) do
-      [{^servo_id, actuator_path, _, _, _, _, _, _, _, _, _}] ->
+      [{^servo_id, actuator_path, _, _, _, _, _, _, _, _, _, _}] ->
         joint_name_from_path(actuator_path)
 
       [] ->

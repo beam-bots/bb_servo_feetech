@@ -23,8 +23,7 @@ defmodule BB.Servo.Feetech.Bridge.ParamMetadataTest do
 
       assert :firmware_version_main in params
       assert :firmware_version_sub in params
-      assert :servo_version_main in params
-      assert :servo_version_sub in params
+      assert :model_number in params
     end
 
     test "includes config parameters" do
@@ -98,7 +97,7 @@ defmodule BB.Servo.Feetech.Bridge.ParamMetadataTest do
   describe "writable?/2" do
     test "returns false for info parameters" do
       refute ParamMetadata.writable?(@control_table, :firmware_version_main)
-      refute ParamMetadata.writable?(@control_table, :servo_version_main)
+      refute ParamMetadata.writable?(@control_table, :model_number)
     end
 
     test "returns true for config parameters" do

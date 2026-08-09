@@ -12,7 +12,7 @@ defmodule BB.Servo.Feetech.Bridge.ParamMetadata do
 
   ## Categories
 
-  - `:info` - Read-only identification (firmware_version, servo_version)
+  - `:info` - Read-only identification (firmware_version, model_number)
   - `:config` - EEPROM settings, require torque off to write (limits, gains, mode)
   - `:control` - SRAM settings, writable at runtime (torque_enable, goal_position)
   """
@@ -30,8 +30,7 @@ defmodule BB.Servo.Feetech.Bridge.ParamMetadata do
   @info_params %{
     firmware_version_main: "Firmware major version",
     firmware_version_sub: "Firmware minor version",
-    servo_version_main: "Servo hardware major version",
-    servo_version_sub: "Servo hardware minor version"
+    model_number: "Servo model (777 = STS3215, 2825 = STS3250)"
   }
 
   @config_params %{

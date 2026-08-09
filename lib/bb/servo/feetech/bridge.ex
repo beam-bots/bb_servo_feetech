@@ -19,7 +19,7 @@ defmodule BB.Servo.Feetech.Bridge do
 
   ## Parameter Categories
 
-  - **info** - Read-only identification (firmware_version, servo_version)
+  - **info** - Read-only identification (firmware_version, model_number)
   - **config** - EEPROM settings, require torque off to write (limits, gains, mode)
   - **control** - SRAM settings, writable at runtime (torque_enable, goal_position)
 

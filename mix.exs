@@ -79,11 +79,22 @@ defmodule BB.Servo.Feetech.MixProject do
     end
   end
 
+  # `feetech` is a workspace sibling rather than a `bb` package, so it follows
+  # `local` and `main` but ignores a pinned `BB_VERSION` — that number is `bb`'s
+  # and says nothing about this one.
+  defp feetech_dep(default) do
+    case System.get_env("BB_VERSION") do
+      "local" -> [path: "../feetech", override: true]
+      "main" -> [git: "https://github.com/beam-bots/feetech.git", override: true]
+      _ -> default
+    end
+  end
+
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
       {:bb, bb_dep("~> 0.26")},
-      {:feetech, "~> 0.2"},
+      {:feetech, feetech_dep("~> 0.4")},
 
       # dev/test
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
