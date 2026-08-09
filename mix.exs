@@ -94,7 +94,7 @@ defmodule BB.Servo.Feetech.MixProject do
   defp deps do
     [
       {:bb, bb_dep("~> 0.26")},
-      {:feetech, feetech_dep("~> 0.3")},
+      {:feetech, feetech_dep("~> 0.4")},
 
       # dev/test
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
