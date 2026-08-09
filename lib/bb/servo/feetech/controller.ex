@@ -450,7 +450,41 @@ defmodule BB.Servo.Feetech.Controller do
   # it, and the speed before the position that travels at it.
   @param_write_order [:torque_limit, :goal_speed, :goal_position]
 
+  # A servo begins moving the moment `goal_position` lands, so a speed sent in a
+  # following packet can arrive after the move has started and be ignored for
+  # it — intermittently, which is the worst way to be wrong. The three registers
+  # are adjacent, so one `sync_write` carries them together and the servo can
+  # never act on a stale speed. `goal_time` is inert on the firmware we have
+  # measured; it is here because the span has to be contiguous.
+  @position_span [:goal_position, :goal_time, :goal_speed]
+
+  # Split by write rather than by command: a servo can have a torque ceiling and
+  # a position move pending in the same tick, and the ceiling has to go out with
+  # the others rather than being swallowed by the span.
   defp write_by_param(state, commands) do
+    moves =
+      for {id, writes} <- commands,
+          {:position_move, {position, speed}} <- writes,
+          do: {id, [position, 0, speed]}
+
+    others =
+      commands
+      |> Enum.map(fn {id, writes} ->
+        {id, Enum.reject(writes, &match?({:position_move, _}, &1))}
+      end)
+      |> Enum.reject(fn {_id, writes} -> writes == [] end)
+
+    # the ceiling before the goal that might reach it
+    write_single_params(state, others)
+    write_position_moves(state, moves)
+  end
+
+  defp write_position_moves(_state, []), do: :ok
+
+  defp write_position_moves(state, moves),
+    do: Feetech.sync_write_raw(state.feetech, @position_span, moves)
+
+  defp write_single_params(state, commands) do
     by_param =
       for {id, writes} <- commands,
           {param, value} <- writes,
@@ -612,13 +646,33 @@ defmodule BB.Servo.Feetech.Controller do
   end
 
   defp write_each(state, servo_id, pending_writes) do
-    Enum.reduce_while(pending_writes, :ok, fn {param, value}, :ok ->
-      case write_param(state, servo_id, param, value) do
+    Enum.reduce_while(pending_writes, :ok, fn write, :ok ->
+      case write_pending(state, servo_id, write) do
         {:ok, _status} -> {:cont, :ok}
         :ok -> {:cont, :ok}
-        {:error, reason} -> {:halt, {:error, {:servo, servo_id, param, reason}}}
+        {:error, reason} -> {:halt, {:error, {:servo, servo_id, elem(write, 0), reason}}}
       end
     end)
+  end
+
+  # Torque is off on the resume path, so the servo cannot start moving before
+  # the speed lands and the two writes need not be atomic. They do need
+  # acknowledging before torque comes back on, which a sync write cannot give.
+  defp write_pending(state, servo_id, {:position_move, {position, speed}}) do
+    with :ok <- acknowledged(state, servo_id, :goal_speed, speed) do
+      acknowledged(state, servo_id, :goal_position, position)
+    end
+  end
+
+  defp write_pending(state, servo_id, {param, value}),
+    do: write_param(state, servo_id, param, value)
+
+  defp acknowledged(state, servo_id, param, value) do
+    case Feetech.write_raw(state.feetech, servo_id, param, value, await_response: true) do
+      {:ok, _status} -> :ok
+      :ok -> :ok
+      {:error, _} = error -> error
+    end
   end
 
   defp enable_torque(state, servo_id) do

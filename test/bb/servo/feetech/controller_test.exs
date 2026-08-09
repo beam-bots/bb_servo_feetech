@@ -516,24 +516,17 @@ defmodule BB.Servo.Feetech.ControllerTest do
   describe "handle_info(:tick) - command processing" do
     setup :controller_state_with_servos
 
-    test "batches each pending param into one sync_write across servos", %{state: state} do
-      :ets.update_element(state.servo_table, 1, [
-        {10, [goal_speed: 0.0, goal_position: 2048]}
-      ])
-
-      :ets.update_element(state.servo_table, 2, [
-        {10, [goal_speed: 1.5, goal_position: 3000]}
-      ])
+    test "position moves go out as one instruction covering the whole span", %{state: state} do
+      :ets.update_element(state.servo_table, 1, [{10, [position_move: {2048, 100}]}])
+      :ets.update_element(state.servo_table, 2, [{10, [position_move: {3000, 400}]}])
 
       Feetech
-      |> expect(:sync_write, fn pid, :goal_speed, values when is_pid(pid) ->
-        assert {1, 0.0} in values
-        assert {2, 1.5} in values
-        :ok
-      end)
-      |> expect(:sync_write_raw, fn pid, :goal_position, values when is_pid(pid) ->
-        assert {1, 2048} in values
-        assert {2, 3000} in values
+      |> expect(:sync_write_raw, fn pid, [:goal_position, :goal_time, :goal_speed], values
+                                    when is_pid(pid) ->
+        # position, time and speed together: a servo starts moving when the
+        # position lands, so a speed in a later packet can miss the move
+        assert {1, [2048, 0, 100]} in values
+        assert {2, [3000, 0, 400]} in values
         :ok
       end)
       |> expect(:sync_read, fn pid, [1, 2], :present_position when is_pid(pid) ->
@@ -551,9 +544,25 @@ defmodule BB.Servo.Feetech.ControllerTest do
       assert pending_writes == nil
     end
 
+    test "a ceiling pending alongside a move is not swallowed by the span", %{state: state} do
+      :ets.update_element(state.servo_table, 1, [
+        {10, [position_move: {2048, 100}]},
+        {11, 0.25}
+      ])
+
+      Feetech
+      |> expect(:sync_write, fn _pid, :torque_limit, [{1, 0.25}] -> :ok end)
+      |> expect(:sync_write_raw, fn _pid, [:goal_position, :goal_time, :goal_speed], _v -> :ok end)
+      |> expect(:sync_read, fn _pid, [1, 2], :present_position -> {:ok, [3.14, 1.57]} end)
+
+      BB |> stub(:publish, fn _robot, _path, _msg -> :ok end)
+
+      assert {:noreply, _state} = Controller.handle_info(:tick, state)
+    end
+
     test "writes the torque ceiling before the goal that might reach it", %{state: state} do
       :ets.update_element(state.servo_table, 1, [
-        {10, [goal_position: 2048]},
+        {10, [position_move: {2048, 100}]},
         {11, 0.25}
       ])
 
@@ -564,7 +573,7 @@ defmodule BB.Servo.Feetech.ControllerTest do
         send(test_pid, :torque_limit)
         :ok
       end)
-      |> expect(:sync_write_raw, fn _pid, :goal_position, [{1, 2048}] ->
+      |> expect(:sync_write_raw, fn _pid, [:goal_position, :goal_time, :goal_speed], _values ->
         send(test_pid, :goal_position)
         :ok
       end)

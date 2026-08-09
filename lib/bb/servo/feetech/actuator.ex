@@ -640,7 +640,7 @@ defmodule BB.Servo.Feetech.Actuator do
   # it was chasing before, so a resume always carries one. An `Effort` ceiling
   # on its own doesn't move anything, so it gets the standstill goal that `Hold`
   # would have used.
-  @motion_params [:goal_position, :goal_speed, :present_position]
+  @motion_params [:position_move, :goal_speed, :present_position]
 
   defp resume(state, pending_writes) do
     writes =
@@ -706,7 +706,7 @@ defmodule BB.Servo.Feetech.Actuator do
     goal_speed = compute_goal_speed(cmd, clamped_motor_angle, state)
     goal_position = motor_angle_to_position(clamped_motor_angle)
 
-    writes = [{:goal_speed, goal_speed}, {:goal_position, goal_position}]
+    writes = [{:position_move, {goal_position, speed_to_raw(goal_speed)}}]
 
     case apply_write(state, writes) do
       :ok ->
@@ -750,6 +750,18 @@ defmodule BB.Servo.Feetech.Actuator do
 
   defp compute_goal_speed(_cmd, _clamped_angle, state),
     do: clamp_speed(state.motor_profile.motor_velocity_limit, state)
+
+  # The span is written raw, so the speed is converted here. In position mode it
+  # is always a magnitude, which makes sign-magnitude and a plain integer the
+  # same encoding. Clamped up to one, because zero in this register means "as
+  # fast as you can" — the opposite of a speed that rounded down to nothing.
+  defp speed_to_raw(rad_per_sec) do
+    rad_per_sec
+    |> abs()
+    |> Kernel./(@radians_per_step)
+    |> round()
+    |> max(1)
+  end
 
   defp clear_pending_writes(state) do
     update_row(state, [{@ets_idx_pending_writes, nil}, {@ets_idx_pending_limit, nil}])
@@ -849,7 +861,9 @@ defmodule BB.Servo.Feetech.Actuator do
     goal_speed = waypoint_speed(waypoint, state)
     goal_position = motor_angle_to_position(clamped_motor_angle)
 
-    case apply_write(state, [{:goal_speed, goal_speed}, {:goal_position, goal_position}]) do
+    writes = [{:position_move, {goal_position, speed_to_raw(goal_speed)}}]
+
+    case apply_write(state, writes) do
       :ok ->
         state = %{state | current_motor_angle: clamped_motor_angle}
         {:noreply, schedule_next_waypoint(trajectory, waypoint, state)}

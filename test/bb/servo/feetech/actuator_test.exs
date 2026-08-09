@@ -1142,7 +1142,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
 
       # The move replaces the goal, but the ceiling is not a goal.
       assert_in_delta torque_limit(servo_table), 0.25, 0.001
-      assert Keyword.has_key?(pending_writes(servo_table), :goal_position)
+      assert Keyword.has_key?(pending_writes(servo_table), :position_move)
     end
 
     test "a ceiling alone doesn't move a passive joint, so a resume carries a standstill",
@@ -1166,7 +1166,7 @@ defmodule BB.Servo.Feetech.ActuatorTest do
     test "a position command goes through the controller's ordered resume", %{state: state} do
       BB.Process
       |> expect(:call, fn TestRobot, :feetech, {:resume_servo, 1, writes} ->
-        assert Keyword.fetch!(writes, :goal_position) == 2048
+        assert {2048, _speed} = Keyword.fetch!(writes, :position_move)
         :ok
       end)
 
@@ -1321,6 +1321,23 @@ defmodule BB.Servo.Feetech.ActuatorTest do
   defp pending_writes(servo_table) do
     [{1, _, _, _, _, _, _, _, _, pending_writes, _, _}] = :ets.lookup(servo_table, 1)
     pending_writes
+  end
+
+  @radians_per_step 2 * :math.pi() / 4096
+
+  # A position move is one pending write carrying raw position and raw speed;
+  # a velocity command is a bare rad/s goal_speed. Both are unpacked here so the
+  # tests can go on asserting in the units they care about.
+  defp goal(servo_table, :goal_position) do
+    {position, _speed} = Keyword.fetch!(pending_writes(servo_table), :position_move)
+    position
+  end
+
+  defp goal(servo_table, :goal_speed) do
+    case Keyword.fetch(pending_writes(servo_table), :position_move) do
+      {:ok, {_position, raw}} -> raw * @radians_per_step
+      :error -> Keyword.fetch!(pending_writes(servo_table), :goal_speed)
+    end
   end
 
   defp goal(servo_table, param), do: Keyword.fetch!(pending_writes(servo_table), param)
