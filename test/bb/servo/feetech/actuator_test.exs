@@ -1013,6 +1013,18 @@ defmodule BB.Servo.Feetech.ActuatorTest do
     end
   end
 
+  describe "capabilities/1" do
+    test "declares position feedback, which the controller's poll loop publishes" do
+      assert Actuator.capabilities([]) == [:position_feedback]
+    end
+
+    test "declares nothing about velocity or effort" do
+      capabilities = Actuator.capabilities(servo_id: 1, controller: :feetech)
+      refute :velocity_feedback in capabilities
+      refute :effort_feedback in capabilities
+    end
+  end
+
   describe "command_payloads/1" do
     test "position mode admits position, trajectory, effort, hold and stop" do
       assert Actuator.command_payloads(mode: :position) ==

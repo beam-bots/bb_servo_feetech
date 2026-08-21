@@ -26,7 +26,10 @@ Feetech.
 2. **Servos are closed-loop; no separate sensor is needed.** The controller
    polls `present_position` and publishes `BB.Message.Sensor.JointState` per
    joint, plus `BB.Servo.Feetech.Message.ServoStatus` (temperature, voltage,
-   load, hardware error).
+   load, hardware error). The actuator declares `:position_feedback` through
+   `c:BB.Actuator.capabilities/1`, so `BB.Dsl` doesn't warn that the joint needs
+   a sensor. Simulation still substitutes an open-loop estimator, since there is
+   no bus to read.
 3. **Command joint-space; the transmission handles motor-space.** Set positions
    in radians via `BB.Actuator`; BB applies the joint's `transmission`
    (`reversed?`, `offset`, gearing) before the value reaches the driver.
@@ -132,7 +135,12 @@ What the actuator accepts depends on its `:mode` — `Position`, `Trajectory`,
 {:ok, cmd} = MyRobot.arm()
 {:ok, :armed, _} = BB.Command.await(cmd)
 
-BB.Actuator.set_position(MyRobot, :servo, 0.5)
+# Synchronous: `:ok` once the driver has taken it, `{:error, %BB.Error{}}` if not
+:ok = BB.Actuator.set_position(MyRobot, :servo, 0.5)
+
+# Fire-and-forget, for time-critical control. Always returns `:ok`; a refusal
+# reaches only the log and the `[:bb, :actuator, :rejected]` telemetry event.
+BB.Actuator.set_position(MyRobot, :servo, 0.5, delivery: :direct)
 
 # Go passive — the joint can be backdriven by hand, and will sag under load
 BB.Actuator.stop(MyRobot, :servo)

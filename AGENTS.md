@@ -15,7 +15,10 @@ bus servos (STS/SCS series). It provides controller, actuator, and parameter bri
 modules that plug into the BB robotics framework's DSL.
 
 Like Dynamixel servos, Feetech servos provide closed-loop position feedback, so no
-separate sensor module is required.
+separate sensor module is required. The actuator's `capabilities/1` declares
+`:position_feedback` so BB's `ValidatePositionFeedback` verifier doesn't warn
+about the joints it drives — the feedback comes from the controller's poll loop,
+which the verifier can't see from the joint's DSL block.
 
 ## Build and Test Commands
 
@@ -69,12 +72,12 @@ Bridge (GenServer) --reads/writes--> Controller --reads/writes--> Servo register
 
 - **Actuator** (`lib/bb/servo/feetech/actuator.ex`) - GenServer that receives position commands
   (radians), converts to servo position (0-4095), writes `goal_position`/`goal_speed` to the
-  controller's ETS command table, and publishes `BB.Message.Actuator.BeginMotion` messages. Accepts commands sent via:
-  - `BB.Actuator.set_position/4` (pubsub)
-  - `BB.Actuator.set_position!/4` (direct)
-  - `BB.Actuator.set_position_sync/5` (synchronous)
+  controller's ETS command table, and publishes `BB.Message.Actuator.BeginMotion` messages.
+  Position commands arrive via `BB.Actuator.set_position/4`, which publishes for observers
+  and delivers by a call (`:ok | {:error, %BB.Error{}}`), or under `delivery: :direct` casts
+  and always answers `:ok`.
 
-  All three arrive at `handle_command/2`; `BB.Actuator.Server` checks arm state and applies
+  Both arrive at `handle_command/2`; `BB.Actuator.Server` checks arm state and applies
   the joint's transmission before the driver sees them.
 
   It also handles `Command.Stop` (cut torque, joint goes passive) and `Command.Hold` (re-apply
@@ -134,15 +137,14 @@ Send commands using the `BB.Actuator` module:
 {:ok, cmd} = MyRobot.arm()
 {:ok, :armed, _} = BB.Command.await(cmd)
 
-# Pubsub delivery (for orchestration/logging). Takes a name or a full path.
-BB.Actuator.set_position(MyRobot, :servo, 0.5)
-BB.Actuator.set_position(MyRobot, [:base, :shoulder, :servo], 0.5)
+# Pubsub delivery (for orchestration/logging), and synchronous: it returns once
+# the driver has taken the command. Takes a name or a full path.
+:ok = BB.Actuator.set_position(MyRobot, :servo, 0.5)
+:ok = BB.Actuator.set_position(MyRobot, [:base, :shoulder, :servo], 0.5)
 
-# Direct delivery (fire-and-forget, lower latency)
-BB.Actuator.set_position!(MyRobot, :servo, 0.5)
-
-# Synchronous delivery (with acknowledgement)
-{:ok, :accepted} = BB.Actuator.set_position_sync(MyRobot, :servo, 0.5)
+# Direct delivery (fire-and-forget, lower latency). Always `:ok` — a refusal
+# reaches only the log and `[:bb, :actuator, :rejected]` telemetry.
+BB.Actuator.set_position(MyRobot, :servo, 0.5, delivery: :direct)
 
 # Go passive — the joint can be backdriven by hand, and will sag under load
 BB.Actuator.stop(MyRobot, :servo)

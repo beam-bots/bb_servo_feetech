@@ -112,7 +112,9 @@ end
 
 The actuator automatically derives its configuration from the joint limits - no
 need to specify servo rotation range or speed separately. Position feedback is
-handled by the controller; no separate sensor is needed.
+handled by the controller; no separate sensor is needed, and the actuator
+declares as much through `c:BB.Actuator.capabilities/1` so BB doesn't warn that
+the joint is unmeasured.
 
 ## Sending Commands
 
@@ -131,41 +133,37 @@ and none can skip the framework's arm check or its joint-to-motor transmission.
 Every function takes either the actuator's unique name or its full path
 through the topology.
 
-### Pubsub Delivery (for orchestration)
+### Pubsub Delivery (the default)
 
-Commands are published via pubsub, enabling logging, replay, and multi-subscriber
-patterns:
+The command is published for orchestration, logging and replay, *and* delivered
+to the actuator by a call, so the caller finds out whether the servo took it:
 
 ```elixir
 # By name
-BB.Actuator.set_position(MyRobot, :shoulder_servo, 0.5)
+:ok = BB.Actuator.set_position(MyRobot, :shoulder_servo, 0.5)
 
 # Or by full path
-BB.Actuator.set_position(MyRobot, [:base, :shoulder, :shoulder_servo], 0.5)
+:ok = BB.Actuator.set_position(MyRobot, [:base, :shoulder, :shoulder_servo], 0.5)
 
 # With options
-BB.Actuator.set_position(MyRobot, :shoulder_servo, 0.5,
-  command_id: make_ref()
-)
+case BB.Actuator.set_position(MyRobot, :shoulder_servo, 0.5, timeout: 1000) do
+  :ok -> :ok
+  {:error, reason} -> handle_error(reason)
+end
 ```
+
+`reason` is a `BB.Error` struct — `BB.Error.State.NotArmed` for a robot that
+isn't armed, `BB.Error.State.UnsupportedCommand` for a command this actuator's
+`mode` doesn't admit.
 
 ### Direct Delivery (for time-critical control)
 
-Commands bypass pubsub for lower latency:
+The command is cast straight to the actuator, publishing nothing. Lower latency,
+but it always returns `:ok` — a refusal reaches only the log and the
+`[:bb, :actuator, :rejected]` telemetry event:
 
 ```elixir
-BB.Actuator.set_position!(MyRobot, :shoulder_servo, 0.5)
-```
-
-### Synchronous Delivery (with acknowledgement)
-
-Wait for the actuator to acknowledge the command:
-
-```elixir
-case BB.Actuator.set_position_sync(MyRobot, :shoulder_servo, 0.5) do
-  {:ok, :accepted} -> :ok
-  {:error, reason} -> handle_error(reason)
-end
+BB.Actuator.set_position(MyRobot, :shoulder_servo, 0.5, delivery: :direct)
 ```
 
 ### Stopping, Holding, and Other Modes
@@ -278,8 +276,11 @@ end
 ### Position Feedback
 
 Unlike PWM servos, Feetech servos report their actual position. The controller
-polls all registered servos and publishes `BB.Message.Sensor.JointState` messages.
-No separate sensor is needed in the robot definition.
+polls all registered servos and publishes `BB.Message.Sensor.JointState` messages,
+which is what writes each joint's configuration into `BB.Robot.State`. No
+separate sensor is needed in the robot definition: the actuator declares
+`:position_feedback` through `c:BB.Actuator.capabilities/1`, which is how BB
+knows.
 
 Subscribe to position updates:
 
