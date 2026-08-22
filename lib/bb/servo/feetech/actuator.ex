@@ -86,6 +86,23 @@ defmodule BB.Servo.Feetech.Actuator do
   None of this is the safety path: making the hardware safe is `disarm/1`, which
   is robot-wide and leaves the robot unable to move until it is armed again.
 
+  ## Position feedback
+
+  These servos answer position queries, so a joint driven by one needs no
+  separate sensor and `capabilities/1` says so. It is the controller that reads
+  and publishes, not the actuator: `BB.Servo.Feetech.Controller` `sync_read`s
+  `present_position` for every registered servo on each tick of its loop and
+  publishes a `BB.Message.Sensor.JointState` per joint, which is what writes the
+  joint's configuration in `BB.Robot.State`. Nothing turns that off —
+  `:status_poll_interval_ms` governs only the temperature/voltage/load poll, and
+  `:position_deadband` suppresses republishing an unchanged position rather than
+  reading it.
+
+  Velocity and effort feedback aren't declared. Speed is never read back at all,
+  and `present_load` is read only by the status poll, which reports it as
+  `BB.Servo.Feetech.Message.ServoStatus` — a percentage of the servo's own
+  limit, not a torque — rather than as joint state.
+
   ## Example DSL Usage
 
       controllers do
@@ -211,6 +228,9 @@ defmodule BB.Servo.Feetech.Actuator do
   # ETS tuple field indices for command writes
   @ets_idx_pending_writes 10
   @ets_idx_pending_limit 11
+
+  @impl BB.Actuator
+  def capabilities(_opts), do: [:position_feedback]
 
   @doc """
   Safety disarm callback.
