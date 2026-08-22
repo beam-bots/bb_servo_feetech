@@ -11,6 +11,13 @@ See [Conventional Commits](Https://conventionalcommits.org) for commit guideline
 
 <!-- changelog -->
 
+## [v0.7.0](https://github.com/beam-bots/bb_servo_pca9685/compare/v0.6.0...v0.7.0) (2026-08-22)
+### Breaking Changes:
+
+* declare `:position_feedback` through `capabilities/1` (#104) by James Harton
+
+
+
 ## [v0.6.0](https://github.com/beam-bots/bb_servo_pca9685/compare/v0.5.1...v0.6.0) (2026-08-09)
 
 
