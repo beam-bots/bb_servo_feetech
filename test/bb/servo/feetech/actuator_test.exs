@@ -458,6 +458,35 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       assert eeprom == [{:lock, false}, {:mode, :velocity}, {:lock, true}]
     end
 
+    test "waits out the grace period when the controller isn't registered yet" do
+      stub(BB.Process, :whereis, fn _robot, _name -> :undefined end)
+
+      {elapsed, result} =
+        :timer.tc(fn -> Actuator.init(base_opts(controller_grace: ~u(150 millisecond))) end)
+
+      assert {:stop, %BB.Error.Hardware.Feetech.ControllerUnavailable{waited_ms: 150}} = result
+
+      # Without the pause the supervisor retries in microseconds and spends its
+      # whole budget before the controller's port is open.
+      assert elapsed >= 150_000
+    end
+
+    test "doesn't wait when the failure isn't the controller being absent" do
+      BB.Process
+      |> stub(:call, fn _robot, _controller, msg ->
+        case msg do
+          {:write, _id, :torque_enable, false} -> :ok
+          {:read, _id, :model_number} -> {:ok, 4242}
+        end
+      end)
+
+      {elapsed, result} =
+        :timer.tc(fn -> Actuator.init(base_opts(controller_grace: ~u(5 second))) end)
+
+      assert {:stop, %BB.Error.Invalid.Feetech.StallTorque{}} = result
+      assert elapsed < 1_000_000
+    end
+
     test "monitors the controller it registered with", %{controller: controller} do
       assert {:ok, %{controller_ref: ref}} = Actuator.init(base_opts())
 
