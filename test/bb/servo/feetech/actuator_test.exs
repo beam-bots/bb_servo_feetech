@@ -16,6 +16,19 @@ defmodule BB.Servo.Feetech.ActuatorTest do
 
   setup :verify_on_exit!
 
+  # The actuator monitors whatever the registry hands back, so every test that
+  # reaches `init/1` needs a live pid to point at. It can't be the test process:
+  # a process monitoring itself is a no-op in Erlang, and the monitor would
+  # silently never exist.
+  setup do
+    controller = spawn(fn -> Process.sleep(:infinity) end)
+    on_exit(fn -> Process.exit(controller, :kill) end)
+
+    stub(BB.Process, :whereis, fn _robot, _name -> controller end)
+
+    %{controller: controller}
+  end
+
   @pi :math.pi()
 
   defp motor_profile(overrides \\ []) do
@@ -443,6 +456,37 @@ defmodule BB.Servo.Feetech.ActuatorTest do
 
       eeprom = Enum.filter(drain_messages(), fn {param, _} -> param in [:lock, :mode] end)
       assert eeprom == [{:lock, false}, {:mode, :velocity}, {:lock, true}]
+    end
+
+    test "monitors the controller it registered with", %{controller: controller} do
+      assert {:ok, %{controller_ref: ref}} = Actuator.init(base_opts())
+
+      Process.exit(controller, :kill)
+
+      assert_receive {:DOWN, ^ref, :process, ^controller, :killed}
+    end
+  end
+
+  describe "a controller that goes down" do
+    setup :armed_state
+
+    test "stops the actuator so init/1 can re-establish it", %{state: state} do
+      state = %{state | controller_ref: ref = make_ref()}
+
+      assert {:stop, :controller_down, state} =
+               Actuator.handle_info({:DOWN, ref, :process, self(), :killed}, state)
+
+      # Both are the restarted controller's to hand out again.
+      assert is_nil(state.controller_ref)
+      assert is_nil(state.servo_table)
+    end
+
+    test "ignores a :DOWN for anything else", %{state: state} do
+      state = %{state | controller_ref: make_ref()}
+      unrelated = make_ref()
+
+      assert {:noreply, ^state} =
+               Actuator.handle_info({:DOWN, unrelated, :process, self(), :killed}, state)
     end
   end
 

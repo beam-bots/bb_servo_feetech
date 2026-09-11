@@ -84,6 +84,11 @@ Bridge (GenServer) --reads/writes--> Controller --reads/writes--> Servo register
   torque where the joint is now resting; a no-op if it never went passive). Any command to a
   joint left passive by a `Stop` resumes on the way past, so callers needn't pair the two.
 
+  It monitors the controller it registered with and stops when that controller goes down.
+  The ETS table belongs to the controller, and the mode, acceleration and stall torque it
+  sets up at startup were written over a bus the replacement reopens from scratch — so
+  recovery is `init/1` running again, not a second path that re-registers in place.
+
   `:mode` fixes the servo's operating mode at startup and decides what `command_payloads/1`
   declares — `:position` or `:velocity`. Anything outside the mode's list is refused by the
   framework with `BB.Error.State.UnsupportedCommand`. The mode register is EEPROM, so it is
