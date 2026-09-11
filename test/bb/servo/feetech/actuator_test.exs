@@ -16,6 +16,19 @@ defmodule BB.Servo.Feetech.ActuatorTest do
 
   setup :verify_on_exit!
 
+  # The actuator monitors whatever the registry hands back, so every test that
+  # reaches `init/1` needs a live pid to point at. It can't be the test process:
+  # a process monitoring itself is a no-op in Erlang, and the monitor would
+  # silently never exist.
+  setup do
+    controller = spawn(fn -> Process.sleep(:infinity) end)
+    on_exit(fn -> Process.exit(controller, :kill) end)
+
+    stub(BB.Process, :whereis, fn _robot, _name -> controller end)
+
+    %{controller: controller}
+  end
+
   @pi :math.pi()
 
   defp motor_profile(overrides \\ []) do
@@ -443,6 +456,66 @@ defmodule BB.Servo.Feetech.ActuatorTest do
 
       eeprom = Enum.filter(drain_messages(), fn {param, _} -> param in [:lock, :mode] end)
       assert eeprom == [{:lock, false}, {:mode, :velocity}, {:lock, true}]
+    end
+
+    test "waits out the grace period when the controller isn't registered yet" do
+      stub(BB.Process, :whereis, fn _robot, _name -> :undefined end)
+
+      {elapsed, result} =
+        :timer.tc(fn -> Actuator.init(base_opts(controller_grace: ~u(150 millisecond))) end)
+
+      assert {:stop, %BB.Error.Hardware.Feetech.ControllerUnavailable{waited_ms: 150}} = result
+
+      # Without the pause the supervisor retries in microseconds and spends its
+      # whole budget before the controller's port is open.
+      assert elapsed >= 150_000
+    end
+
+    test "doesn't wait when the failure isn't the controller being absent" do
+      BB.Process
+      |> stub(:call, fn _robot, _controller, msg ->
+        case msg do
+          {:write, _id, :torque_enable, false} -> :ok
+          {:read, _id, :model_number} -> {:ok, 4242}
+        end
+      end)
+
+      {elapsed, result} =
+        :timer.tc(fn -> Actuator.init(base_opts(controller_grace: ~u(5 second))) end)
+
+      assert {:stop, %BB.Error.Invalid.Feetech.StallTorque{}} = result
+      assert elapsed < 1_000_000
+    end
+
+    test "monitors the controller it registered with", %{controller: controller} do
+      assert {:ok, %{controller_ref: ref}} = Actuator.init(base_opts())
+
+      Process.exit(controller, :kill)
+
+      assert_receive {:DOWN, ^ref, :process, ^controller, :killed}
+    end
+  end
+
+  describe "a controller that goes down" do
+    setup :armed_state
+
+    test "stops the actuator so init/1 can re-establish it", %{state: state} do
+      state = %{state | controller_ref: ref = make_ref()}
+
+      assert {:stop, :controller_down, state} =
+               Actuator.handle_info({:DOWN, ref, :process, self(), :killed}, state)
+
+      # Both are the restarted controller's to hand out again.
+      assert is_nil(state.controller_ref)
+      assert is_nil(state.servo_table)
+    end
+
+    test "ignores a :DOWN for anything else", %{state: state} do
+      state = %{state | controller_ref: make_ref()}
+      unrelated = make_ref()
+
+      assert {:noreply, ^state} =
+               Actuator.handle_info({:DOWN, unrelated, :process, self(), :killed}, state)
     end
   end
 

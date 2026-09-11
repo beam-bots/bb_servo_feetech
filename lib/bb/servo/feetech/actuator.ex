@@ -20,6 +20,15 @@ defmodule BB.Servo.Feetech.Actuator do
   3. Registers with the controller, receiving the shared ETS table reference
   4. Subscribes to the commands its mode admits
 
+  The registration is monitored. A restarted controller opens a new bus and a
+  new ETS table, and none of the setup above carries across, so the actuator
+  stops when its controller goes down and lets `init/1` run the whole sequence
+  again against the replacement.
+
+  Coming back up it races the controller, which has a port to open first, so a
+  controller that isn't registered yet is waited on for `:controller_grace`
+  before this actuator gives up and lets its supervisor try again.
+
   When a position command is received, the actuator:
   1. Clamps the position to motor limits
   2. Converts to servo position units (0-4095 for 360 degrees)
@@ -118,6 +127,7 @@ defmodule BB.Servo.Feetech.Actuator do
         actuator :servo, {BB.Servo.Feetech.Actuator, servo_id: 1, controller: :feetech}
       end
   """
+  import BB.Unit
   import BB.Unit.Option
 
   use BB.Actuator,
@@ -167,10 +177,27 @@ defmodule BB.Servo.Feetech.Actuator do
         backdrivable when nothing is asking it to move wants `:stop`.
         """,
         default: :stop
+      ],
+      controller_grace: [
+        type: unit_type(compatible: :second),
+        doc: """
+        How long to wait for a controller that isn't registered before giving
+        up and letting the supervisor restart this actuator.
+
+        Paid only when the controller is missing, which in practice means it
+        is restarting and this actuator is on its way back up too. The wait is
+        also what makes the joint supervisor's restart budget mean anything:
+        `Supervisor` re-runs a failed start with no backoff, so without it the
+        default three attempts are spent in well under a millisecond. Raise it
+        for a bus whose port is slow to open — a USB adapter re-enumerating
+        takes far longer than a built-in UART.
+        """,
+        default: ~u(100 millisecond)
       ]
     ]
 
   alias BB.Dsl.Info
+  alias BB.Error.Hardware.Feetech.ControllerUnavailable, as: ControllerUnavailableError
   alias BB.Error.Invalid.Feetech.StallTorque, as: StallTorqueError
   alias BB.Error.Invalid.Feetech.UnknownController, as: UnknownControllerError
   alias BB.Error.Invalid.JointConfig, as: JointConfigError
@@ -185,6 +212,8 @@ defmodule BB.Servo.Feetech.Actuator do
     defstruct [
       :bb,
       :controller,
+      :controller_grace_ms,
+      :controller_ref,
       :current_motor_angle,
       :expiry_timer,
       :joint_name,
@@ -247,12 +276,13 @@ defmodule BB.Servo.Feetech.Actuator do
   def init(opts) do
     with {:ok, state} <- build_state(opts),
          :ok <- validate_controller(state),
+         :ok <- await_controller(state),
          :ok <- disable_torque(state),
          {:ok, state} <- resolve_stall_torque(state),
          :ok <- configure_mode(state),
          :ok <- write_acceleration(state),
-         {:ok, servo_table} <- register_servo(state) do
-      {:ok, %{state | servo_table: servo_table}}
+         {:ok, state} <- register_servo(state) do
+      {:ok, state}
     else
       {:error, reason} -> {:stop, reason}
     end
@@ -285,6 +315,7 @@ defmodule BB.Servo.Feetech.Actuator do
       state = %State{
         bb: opts.bb,
         controller: opts.controller,
+        controller_grace_ms: milliseconds(Map.get(opts, :controller_grace, ~u(100 millisecond))),
         current_motor_angle: motor_profile.motor_initial_position,
         expiry_action: Map.get(opts, :expiry_action, :stop),
         joint_name: joint_name,
@@ -385,6 +416,29 @@ defmodule BB.Servo.Feetech.Actuator do
   # the controllers that do exist. Every controller starts before any actuator,
   # so a name that isn't declared is a typo rather than a race — and catching it
   # here beats the bare `:noproc` the first call would otherwise exit with.
+  # Checked against the registry, where `validate_controller/1` checks the DSL:
+  # the name being right and the process being there are separate questions, and
+  # after a controller crash only the second one fails. Every call `init/1` goes
+  # on to make would exit `:noproc`, so it stops here — but not before pausing,
+  # because the supervisor retries a failed start with no backoff and would
+  # otherwise spend its whole budget before the controller's port was open.
+  defp await_controller(state) do
+    case BBProcess.whereis(state.bb.robot, state.controller) do
+      pid when is_pid(pid) ->
+        :ok
+
+      :undefined ->
+        Process.sleep(state.controller_grace_ms)
+
+        {:error,
+         %ControllerUnavailableError{
+           controller: state.controller,
+           actuator_path: state.bb.path,
+           waited_ms: state.controller_grace_ms
+         }}
+    end
+  end
+
   defp validate_controller(state) do
     known = state.bb.robot |> Info.controllers() |> Enum.map(& &1.name) |> Enum.sort()
 
@@ -509,13 +563,25 @@ defmodule BB.Servo.Feetech.Actuator do
     |> max(1)
   end
 
+  # The table belongs to the controller, and a restarted controller hands out a
+  # new one, so the actuator has no business outliving its registration. The
+  # monitor goes on after the call rather than before: a monitor on a pid that
+  # has already gone delivers `:DOWN` straight away, so nothing is missed.
   defp register_servo(state) do
-    BBProcess.call(
-      state.bb.robot,
-      state.controller,
-      {:register_servo, state.servo_id, state.bb.path, state.position_deadband}
-    )
+    controller = BBProcess.whereis(state.bb.robot, state.controller)
+
+    with {:ok, servo_table} <-
+           BBProcess.call(
+             state.bb.robot,
+             state.controller,
+             {:register_servo, state.servo_id, state.bb.path, state.position_deadband}
+           ) do
+      {:ok, %{state | controller_ref: monitor_controller(controller), servo_table: servo_table}}
+    end
   end
+
+  defp monitor_controller(pid) when is_pid(pid), do: Process.monitor(pid)
+  defp monitor_controller(:undefined), do: nil
 
   # --- Command handling ---
 
@@ -619,6 +685,14 @@ defmodule BB.Servo.Feetech.Actuator do
       :hold -> do_hold(state)
     end
   end
+
+  # Everything this actuator knows about its servo lives in the controller's ETS
+  # table, and the configuration that got it there — mode, acceleration, stall
+  # torque — was written over a bus the controller has just dropped. Stopping
+  # puts `init/1` back in charge of re-establishing the lot against the
+  # replacement, rather than keeping a second recovery path in step with it.
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %State{controller_ref: ref} = state),
+    do: {:stop, :controller_down, %{state | controller_ref: nil, servo_table: nil}}
 
   def handle_info(_message, state), do: {:noreply, state}
 
@@ -951,6 +1025,13 @@ defmodule BB.Servo.Feetech.Actuator do
     motor_angle
     |> max(lower)
     |> min(upper)
+  end
+
+  defp milliseconds(unit) do
+    unit
+    |> Localize.Unit.convert!(BB.Unit.unit_name(:millisecond))
+    |> Units.extract_float()
+    |> round()
   end
 
   defp newton_metres(nil), do: nil
