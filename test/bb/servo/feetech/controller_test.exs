@@ -13,78 +13,70 @@ defmodule BB.Servo.Feetech.ControllerTest do
   setup :verify_on_exit!
 
   describe "disarm/1" do
-    test "disables torque and lock on all registered servo IDs with acknowledged writes" do
+    test "disables torque and lock on every servo the controller currently knows" do
       feetech_pid = self()
+      test_pid = self()
+
+      stub_live_servo_ids([1, 2, 3])
 
       Feetech
-      |> expect(:write_raw, 4, fn ^feetech_pid, id, register, 0, opts ->
-        assert id in [1, 2]
-        assert register in [:torque_enable, :lock]
+      |> expect(:write_raw, 6, fn ^feetech_pid, id, register, 0, opts ->
         assert Keyword.fetch!(opts, :await_response)
+        send(test_pid, {:wrote, id, register})
         {:ok, %{}}
       end)
 
-      opts = [
-        feetech: feetech_pid,
-        servo_ids: [1, 2],
-        disarm_action: :disable_torque
-      ]
+      assert :ok = Controller.disarm(disarm_opts(feetech: feetech_pid))
 
-      assert :ok = Controller.disarm(opts)
+      for id <- [1, 2, 3], register <- [:torque_enable, :lock] do
+        assert_received {:wrote, ^id, ^register}
+      end
     end
 
-    test "returns :ok when no servos registered" do
+    test "returns an error when no servos are registered yet" do
+      stub_live_servo_ids([])
+
       Feetech |> reject(:write_raw, 5)
 
-      opts = [
-        feetech: self(),
-        servo_ids: [],
-        disarm_action: :disable_torque
-      ]
-
-      assert :ok = Controller.disarm(opts)
+      assert {:error, :no_servos_registered} = Controller.disarm(disarm_opts())
     end
 
-    test "returns :ok with :hold action without disabling torque" do
+    test "returns an error when the controller is unreachable" do
+      start_supervised!({Registry, keys: :unique, name: BB.Process.registry_name(TestRobot)})
+
       Feetech |> reject(:write_raw, 5)
 
-      opts = [
-        feetech: self(),
-        servo_ids: [1, 2],
-        disarm_action: :hold
-      ]
+      assert {:error, {:exit, _reason}} = Controller.disarm(disarm_opts())
+    end
 
-      assert :ok = Controller.disarm(opts)
+    test "returns :ok with :hold action without asking for the servo list" do
+      BB.Process |> reject(:call, 4)
+      Feetech |> reject(:write_raw, 5)
+
+      assert :ok = Controller.disarm(disarm_opts(disarm_action: :hold))
     end
 
     test "returns an error when a torque-disable write is rejected" do
       feetech_pid = self()
+
+      stub_live_servo_ids([1, 2])
 
       Feetech
       |> stub(:write_raw, fn ^feetech_pid, id, :torque_enable, 0, _opts ->
         if id == 2, do: {:error, :timeout}, else: {:ok, %{}}
       end)
 
-      opts = [
-        feetech: feetech_pid,
-        servo_ids: [1, 2],
-        disarm_action: :disable_torque
-      ]
-
-      assert {:error, {:servo, 2, :torque_enable, :timeout}} = Controller.disarm(opts)
+      assert {:error, {:servo, 2, :torque_enable, :timeout}} =
+               Controller.disarm(disarm_opts(feetech: feetech_pid))
     end
 
     test "returns an error when the feetech process is dead" do
       {:ok, dead_pid} = Agent.start(fn -> :ok end)
       Agent.stop(dead_pid)
 
-      opts = [
-        feetech: dead_pid,
-        servo_ids: [1, 2],
-        disarm_action: :disable_torque
-      ]
+      stub_live_servo_ids([1, 2])
 
-      assert {:error, {:exit, _reason}} = Controller.disarm(opts)
+      assert {:error, {:exit, _reason}} = Controller.disarm(disarm_opts(feetech: dead_pid))
     end
   end
 
@@ -162,7 +154,12 @@ defmodule BB.Servo.Feetech.ControllerTest do
       |> expect(:register, fn Controller, opts ->
         assert Keyword.get(opts, :robot) == TestRobot
         assert Keyword.get(opts, :path) == [:feetech]
-        assert Keyword.get(opts, :opts)[:feetech] == feetech_pid
+
+        disarm_opts = Keyword.get(opts, :opts)
+        assert disarm_opts[:feetech] == feetech_pid
+        assert disarm_opts[:robot] == TestRobot
+        assert disarm_opts[:name] == :feetech
+        assert disarm_opts[:disarm_action] == :disable_torque
         :ok
       end)
 
@@ -207,12 +204,6 @@ defmodule BB.Servo.Feetech.ControllerTest do
     setup :controller_state
 
     test "registers a servo in ETS and updates servo_ids", %{state: state} do
-      BB.Safety
-      |> expect(:register, fn Controller, opts ->
-        assert 1 in Keyword.get(opts, :opts)[:servo_ids]
-        :ok
-      end)
-
       message = {:register_servo, 1, [:shoulder, :servo], 2}
 
       assert {:reply, {:ok, servo_table}, new_state} =
@@ -238,6 +229,15 @@ defmodule BB.Servo.Feetech.ControllerTest do
       assert pending_writes == nil
       assert pending_limit == nil
       assert torque_enabled == false
+    end
+
+    test "does not re-register its safety handler", %{state: state} do
+      BB.Safety |> reject(:register, 2)
+
+      message = {:register_servo, 1, [:shoulder, :servo], 2}
+
+      assert {:reply, {:ok, _table}, _state} =
+               Controller.handle_call(message, {self(), make_ref()}, state)
     end
 
     test "refuses a servo ID another actuator already drives", %{state: state} do
@@ -757,6 +757,26 @@ defmodule BB.Servo.Feetech.ControllerTest do
     state = %{base.state | servo_ids: [1, 2]}
 
     %{state: state, servo_table: base.servo_table}
+  end
+
+  defp disarm_opts(overrides \\ []) do
+    Keyword.merge(
+      [
+        feetech: self(),
+        robot: TestRobot,
+        name: :feetech,
+        disarm_action: :disable_torque
+      ],
+      overrides
+    )
+  end
+
+  defp stub_live_servo_ids(servo_ids) do
+    BB.Process
+    |> expect(:call, fn TestRobot, :feetech, :list_servos, timeout ->
+      assert is_integer(timeout)
+      {:ok, servo_ids}
+    end)
   end
 
   defp torque_enabled?(servo_table, servo_id) do
