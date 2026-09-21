@@ -40,7 +40,10 @@ Feetech.
    and hardware agree about arrival times either way.
 5. **Torque is centralised in the controller.** On arm it enables torque on all
    registered servos; on disarm or crash it disables (or holds) torque for every
-   servo ID in one pass. The actuator's `disarm/1` is a deliberate no-op.
+   servo ID in one pass. The actuator's `disarm/1` is a deliberate no-op. The
+   servo list is read from the controller as the disarm runs, so a disarm that
+   arrives before any actuator has registered — during startup, or a topology
+   restart — fails rather than reporting an empty success.
 
 ## Wiring it into the DSL
 
