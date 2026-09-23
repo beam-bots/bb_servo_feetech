@@ -11,6 +11,15 @@ See [Conventional Commits](Https://conventionalcommits.org) for commit guideline
 
 <!-- changelog -->
 
+## [v0.7.2](https://github.com/beam-bots/bb_servo_pca9685/compare/v0.7.1...v0.7.2) (2026-09-23)
+
+
+
+
+### Bug Fixes:
+
+* read the live servo list when disarming (#126) by James Harton
+
 ## [v0.7.1](https://github.com/beam-bots/bb_servo_pca9685/compare/v0.7.0...v0.7.1) (2026-09-11)
 
 
