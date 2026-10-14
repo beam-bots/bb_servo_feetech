@@ -656,20 +656,22 @@ defmodule BB.Servo.Feetech.ActuatorTest do
     end
 
     test "uses velocity for expected_arrival calculation", %{state: state} do
-      BB.Actuator
-      |> expect(:publish_begin_motion, fn TestRobot, [:shoulder, :servo], opts ->
-        # Moving 0.5 rad at 1.0 rad/s = 500ms
-        now = System.monotonic_time(:millisecond)
-        expected_travel = round(0.5 / 1.0 * 1000)
-        assert_in_delta opts[:expected_arrival], now + expected_travel, 50
-        :ok
-      end)
+      expect_begin_motion_reported()
 
       cmd = %Command.Position{position: 0.5, velocity: 1.0}
       msg = %Message{payload: cmd}
 
+      before = System.monotonic_time(:millisecond)
+
       assert {:noreply, _state} =
                Actuator.handle_command(msg, state)
+
+      assert_receive {:begin_motion, expected_arrival, published_at}
+
+      # Moving 0.5 rad at 1.0 rad/s = 500ms
+      expected_travel = round(0.5 / 1.0 * 1000)
+      assert expected_arrival >= before + expected_travel
+      assert expected_arrival <= published_at + expected_travel
     end
 
     test "falls back to the joint's velocity limit when no hints provided", %{
@@ -718,36 +720,37 @@ defmodule BB.Servo.Feetech.ActuatorTest do
     end
 
     test "uses duration for expected_arrival calculation", %{state: state} do
-      BB.Actuator
-      |> expect(:publish_begin_motion, fn TestRobot, [:shoulder, :servo], opts ->
-        now = System.monotonic_time(:millisecond)
-        assert_in_delta opts[:expected_arrival], now + 500, 50
-        :ok
-      end)
+      expect_begin_motion_reported()
 
       cmd = %Command.Position{position: 0.5, duration: 500}
       msg = %Message{payload: cmd}
 
+      before = System.monotonic_time(:millisecond)
+
       assert {:noreply, _state} =
                Actuator.handle_command(msg, state)
+
+      assert_receive {:begin_motion, expected_arrival, published_at}
+      assert expected_arrival >= before + 500
+      assert expected_arrival <= published_at + 500
     end
 
     test "a duration the joint cannot meet reports the arrival it can", %{state: state} do
       # 1.0 rad in 200ms needs 5 rad/s; the joint's limit is pi/3 (~1.047),
       # so the move is clamped and actually takes about 955ms.
-      BB.Actuator
-      |> expect(:publish_begin_motion, fn TestRobot, [:shoulder, :servo], opts ->
-        now = System.monotonic_time(:millisecond)
-        honest = round(1.0 / (@pi / 3) * 1000)
-        assert_in_delta opts[:expected_arrival], now + honest, 50
-        refute_in_delta opts[:expected_arrival], now + 200, 50
-        :ok
-      end)
+      expect_begin_motion_reported()
 
       # the joint's upper limit is pi/2, so 1.0 rad is reachable
       cmd = %Command.Position{position: 1.0, duration: 200}
 
+      before = System.monotonic_time(:millisecond)
       assert {:noreply, _state} = Actuator.handle_command(%Message{payload: cmd}, state)
+
+      assert_receive {:begin_motion, expected_arrival, published_at}
+
+      honest = round(1.0 / (@pi / 3) * 1000)
+      assert expected_arrival >= before + honest
+      assert expected_arrival <= published_at + honest
     end
 
     test "a velocity of zero falls back to the joint's limit", %{
@@ -1441,6 +1444,19 @@ defmodule BB.Servo.Feetech.ActuatorTest do
       ],
       overrides
     )
+  end
+
+  defp expect_begin_motion_reported do
+    test_pid = self()
+
+    expect(BB.Actuator, :publish_begin_motion, fn TestRobot, [:shoulder, :servo], opts ->
+      send(
+        test_pid,
+        {:begin_motion, opts[:expected_arrival], System.monotonic_time(:millisecond)}
+      )
+
+      :ok
+    end)
   end
 
   defp drain_messages(acc \\ []) do
